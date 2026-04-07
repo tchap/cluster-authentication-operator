@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -13,6 +13,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/cenkalti/backoff/v4"
+	"golang.org/x/sync/errgroup"
 
 	configv1 "github.com/openshift/api/config/v1"
 	operatorv1 "github.com/openshift/api/operator/v1"
@@ -25,6 +28,7 @@ import (
 	"github.com/openshift/cluster-authentication-operator/pkg/transport"
 	"github.com/openshift/library-go/pkg/controller/factory"
 	"github.com/openshift/library-go/pkg/operator/events"
+	"github.com/openshift/library-go/pkg/operator/resource/retry"
 	"github.com/openshift/library-go/pkg/operator/v1helpers"
 
 	corev1 "k8s.io/api/core/v1"
@@ -35,6 +39,16 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	corev1lister "k8s.io/client-go/listers/core/v1"
 	"k8s.io/klog/v2"
+)
+
+// The following constants are put together so that
+// all attempts fit safely into resyncInterval.
+const (
+	resyncInterval = 1 * time.Minute
+
+	defaultRequestTimeout = 5 * time.Second
+	defaultRetryInterval  = 2 * time.Second
+	defaultAttemptCount   = 3
 )
 
 var kasServicePort int
@@ -60,6 +74,15 @@ type wellKnownReadyController struct {
 	routeLister            routev1lister.RouteLister
 	infrastructureLister   configv1lister.InfrastructureLister
 	authConfigChecker      common.AuthConfigChecker
+	// requestTimeout is the per-request context timeout.
+	// Defaults to defaultRequestTimeout when unset.
+	requestTimeout time.Duration
+	// retryInterval is the sleep duration between retry attempts.
+	// Defaults to defaultRetryInterval when unset.
+	retryInterval time.Duration
+	// attemptCount is the maximum number of fetch+check cycles.
+	// Defaults to defaultAttemptCount when unset.
+	attemptCount int
 }
 
 const controllerName = "WellKnownReadyController"
@@ -100,7 +123,7 @@ func NewWellKnownReadyController(
 		WithInformers(common.AuthConfigCheckerInformers[factory.Informer](&authConfigChecker)...).
 		WithSync(c.sync).
 		WithSyncDegradedOnError(operatorClient).
-		ResyncEvery(wait.Jitter(time.Minute, 1.0)).
+		ResyncEvery(wait.Jitter(resyncInterval, 1.0)).
 		ToController(
 			controllerName, // Don't change what is passed here unless you also remove the old FooDegraded condition
 			recorder.WithComponentSuffix("wellknown-ready-controller"))
@@ -222,11 +245,14 @@ func (c *wellKnownReadyController) isWellknownEndpointsReady(ctx context.Context
 		return fmt.Errorf("failed to get API server IPs: %v (check kube-apiserver that it deploys correctly)", err)
 	}
 
+	eg, ctx := errgroup.WithContext(ctx)
 	for _, ip := range ips {
-		err := c.checkWellknownEndpointReady(ctx, ip, rt)
-		if err != nil {
-			return err
-		}
+		eg.Go(func() error {
+			return c.checkWellknownEndpointReady(ctx, ip, rt)
+		})
+	}
+	if err := eg.Wait(); err != nil {
+		return err
 	}
 
 	// if we don't have the min number of masters, this is actually ok, however Clayton has draw a hardline on starting tests as soon as all operators are Available=true
@@ -263,7 +289,7 @@ func (c *wellKnownReadyController) checkWellknownEndpointReady(ctx context.Conte
 
 	var connError error
 	var resp *http.Response
-	for i := 0; i < 3; i++ {
+	checkFn := func() error {
 		reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
 
@@ -272,40 +298,45 @@ func (c *wellKnownReadyController) checkWellknownEndpointReady(ctx context.Conte
 		if err != nil {
 			connError = fmt.Errorf("failed to GET kube-apiserver oauth endpoint %s: %w%s", wellKnown, err, wellKnownRoundtripErrorHint(err))
 			klog.V(2).Info(connError)
-			continue
+			return connError
 		}
-		connError = nil
 		defer resp.Body.Close()
-		break
+
+		switch resp.StatusCode {
+		case 200:
+			// success
+		case http.StatusNotFound:
+			return common.NewControllerProgressingError("OAuthMetadataNotYetServed", fmt.Errorf("kube-apiserver oauth endpoint %s is not yet served and authentication operator keeps waiting (check kube-apiserver operator, and check that instances roll out successfully, which can take several minutes per instance)", wellKnown), 5*time.Minute)
+		default:
+			return fmt.Errorf("kube-apiserver oauth endpoint %s replied with unexpected status: %s (check kube-apiserver logs if this error persists)", wellKnown, resp.Status)
+		}
+
+		var receivedValues map[string]interface{}
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return fmt.Errorf("failed to read %s body: %v (check kube-apiserver logs if this error persists)", wellKnown, err)
+		}
+		if err := json.Unmarshal(body, &receivedValues); err != nil {
+			return fmt.Errorf("failed to unmarshal %s JSON: %v (check kube-apiserver logs if this error persists)", wellKnown, err)
+		}
+
+		if !reflect.DeepEqual(expectedMetadata, receivedValues) {
+			return common.NewControllerProgressingError("OAuthMetadataDiffer", fmt.Errorf("the %s endpoint returns different oauth metadata than is stored in openshift-config-managed/oauth-openshift ConfigMap (check kube-apiserver operator that instances roll out, which happens when oauth metadata changes)", wellKnown), 5*time.Minute)
+		}
+		return nil
 	}
 
-	if connError != nil {
-		return connError
-	}
-
-	switch resp.StatusCode {
-	case 200:
-		// success
-	case http.StatusNotFound:
-		return common.NewControllerProgressingError("OAuthMetadataNotYetServed", fmt.Errorf("kube-apiserver oauth endpoint %s is not yet served and authentication operator keeps waiting (check kube-apiserver operator, and check that instances roll out successfully, which can take several minutes per instance)", wellKnown), 5*time.Minute)
-	default:
-		return fmt.Errorf("kube-apiserver oauth endpoint %s replied with unexpected status: %s (check kube-apiserver logs if this error persists)", wellKnown, resp.Status)
-	}
-
-	var receivedValues map[string]interface{}
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("failed to read %s body: %v (check kube-apiserver logs if this error persists)", wellKnown, err)
-	}
-	if err := json.Unmarshal(body, &receivedValues); err != nil {
-		return fmt.Errorf("failed to unmarshal %s JSON: %v (check kube-apiserver logs if this error persists)", wellKnown, err)
-	}
-
-	if !reflect.DeepEqual(expectedMetadata, receivedValues) {
-		return common.NewControllerProgressingError("OAuthMetadataDiffer", fmt.Errorf("the %s endpoint returns different oauth metadata than is stored in openshift-config-managed/oauth-openshift ConfigMap (check kube-apiserver operator that instances roll out, which happens when oauth metadata changes)", wellKnown), 5*time.Minute)
-	}
-
-	return nil
+	// Run checkFn given number of times. Getting a timeout from checkFn causes an immediate retry,
+	// we don't wait another retryInterval before performing the next check.
+	skippableBoff := retry.NewSkippableBackOff(backoff.NewConstantBackOff(retryInterval))
+	boff := backoff.WithContext(backoff.WithMaxRetries(skippableBoff, uint64(attempts-1)), ctx)
+	_ = backoff.Retry(func() error {
+		err := checkFn()
+		if errors.Is(err, context.DeadlineExceeded) {
+			skippableBoff.SkipNext()
+		}
+		return err
+	}, boff)
 }
 
 func wellKnownRoundtripErrorHint(err error) string {
