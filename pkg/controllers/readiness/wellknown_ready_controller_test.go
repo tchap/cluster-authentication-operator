@@ -1,13 +1,13 @@
 package readiness
 
 import (
+	"bytes"
 	"context"
-	"crypto/x509"
+	"io"
 	"net"
 	"net/http"
-	"net/http/httptest"
-	"net/url"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/require"
@@ -17,159 +17,131 @@ import (
 	"k8s.io/client-go/tools/cache"
 )
 
-type testServer struct {
-	sendData      []byte
-	sendStatus    int
-	responseDelay time.Duration
-}
-
-func (trt *testServer) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	if trt.responseDelay > 0 {
-		time.Sleep(trt.responseDelay)
-	}
-
-	w.WriteHeader(trt.sendStatus)
-	w.Write(trt.sendData)
-}
-
 type testRoundTripper struct {
-	failTimes int
-	err       error
-
-	failCounter int
-
-	delegate *http.Transport
+	body      []byte
+	status    int
+	delay     time.Duration
+	failErr   error
+	failLeftN int
 }
 
 func (trt *testRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	if trt.failCounter < trt.failTimes {
-		trt.failCounter++
-		return nil, trt.err
+	if trt.failLeftN > 0 {
+		trt.failLeftN--
+		return nil, trt.failErr
 	}
 
-	return trt.delegate.RoundTrip(req)
+	if trt.delay > 0 {
+		select {
+		case <-time.After(trt.delay):
+		case <-req.Context().Done():
+			return nil, req.Context().Err()
+		}
+	}
+
+	return &http.Response{
+		StatusCode: trt.status,
+		Body:       io.NopCloser(bytes.NewReader(trt.body)),
+	}, nil
 }
 
 func Test_wellKnownReadyController_checkWellknownEndpointReady(t *testing.T) {
-
 	tests := []struct {
-		name             string
-		cmOAuthData      string
-		testServerConfig *testServer
-		testRoundTripper *testRoundTripper
-		wantErr          bool
+		name        string
+		cmOAuthData string
+		rt          *testRoundTripper
+		wantErr     bool
 	}{
 		{
 			name:        "wellknown endpoint not found",
 			cmOAuthData: `{"data": "some data"}`,
-			testServerConfig: &testServer{
-				sendStatus: http.StatusNotFound,
-			},
-			wantErr: true,
+			rt:          &testRoundTripper{status: http.StatusNotFound},
+			wantErr:     true,
 		},
 		{
 			name:        "wellknown endpoint data is stale",
 			cmOAuthData: `{"data": "new data"}`,
-			testServerConfig: &testServer{
-				sendStatus: http.StatusOK,
-				sendData:   []byte(`{"data": "old data"}`),
+			rt: &testRoundTripper{
+				status: http.StatusOK,
+				body:   []byte(`{"data": "old data"}`),
 			},
 			wantErr: true,
 		},
 		{
 			name:        "everything's fine",
 			cmOAuthData: `{"data": "some data"}`,
-			testServerConfig: &testServer{
-				sendStatus: http.StatusOK,
-				sendData:   []byte(`{"data": "some data"}`),
+			rt: &testRoundTripper{
+				status: http.StatusOK,
+				body:   []byte(`{"data": "some data"}`),
 			},
-			wantErr: false,
 		},
 		{
 			name:        "wellknown endpoint is intermittently unavailable",
 			cmOAuthData: `{"data": "some data"}`,
-			testServerConfig: &testServer{
-				sendStatus: http.StatusOK,
-				sendData:   []byte(`{"data": "some data"}`),
+			rt: &testRoundTripper{
+				status:    http.StatusOK,
+				body:      []byte(`{"data": "some data"}`),
+				failLeftN: 2,
+				failErr:   net.Error(&net.DNSError{}),
 			},
-			testRoundTripper: &testRoundTripper{
-				failTimes: 2,
-				err:       net.Error(&net.DNSError{}),
-			},
-			wantErr: false,
 		},
 		{
 			name:        "wellknown endpoint request always fails",
 			cmOAuthData: `{"data": "some data"}`,
-			testServerConfig: &testServer{
-				sendStatus: http.StatusOK,
-				sendData:   []byte(`{"data": "some data"}`),
-			},
-			testRoundTripper: &testRoundTripper{
-				failTimes: 100,
-				err:       net.Error(&net.DNSError{}),
+			rt: &testRoundTripper{
+				status:    http.StatusOK,
+				body:      []byte(`{"data": "some data"}`),
+				failLeftN: 100,
+				failErr:   net.Error(&net.DNSError{}),
 			},
 			wantErr: true,
 		},
 		{
 			name:        "wellknown endpoint response takes too long",
 			cmOAuthData: `{"data": "some data"}`,
-			testServerConfig: &testServer{
-				responseDelay: 7 * time.Second,
-				sendStatus:    http.StatusOK,
-				sendData:      []byte(`{"data": "some data"}`),
+			rt: &testRoundTripper{
+				delay:  7 * time.Second,
+				status: http.StatusOK,
+				body:   []byte(`{"data": "some data"}`),
 			},
 			wantErr: true,
 		},
 		{
 			name:        "wellknown endpoint response is slightly delayed",
 			cmOAuthData: `{"data": "some data"}`,
-			testServerConfig: &testServer{
-				responseDelay: 3 * time.Second,
-				sendStatus:    http.StatusOK,
-				sendData:      []byte(`{"data": "some data"}`),
+			rt: &testRoundTripper{
+				delay:  3 * time.Second,
+				status: http.StatusOK,
+				body:   []byte(`{"data": "some data"}`),
 			},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cm := &corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "oauth-openshift",
-					Namespace: "openshift-config-managed",
-				},
-				Data: map[string]string{
-					"oauthMetadata": tt.cmOAuthData,
-				},
-			}
-			s := httptest.NewTLSServer(tt.testServerConfig)
-			defer s.Close()
-			rootCAs := x509.NewCertPool()
-			rootCAs.AddCert(s.Certificate())
+			synctest.Test(t, func(t *testing.T) {
+				cm := &corev1.ConfigMap{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "oauth-openshift",
+						Namespace: "openshift-config-managed",
+					},
+					Data: map[string]string{
+						"oauthMetadata": tt.cmOAuthData,
+					},
+				}
 
-			cmIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
-			require.NoError(t, cmIndexer.Add(cm))
+				cmIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+				require.NoError(t, cmIndexer.Add(cm))
 
-			c := &wellKnownReadyController{
-				configMapLister: corev1listers.NewConfigMapLister(cmIndexer),
-			}
+				c := &wellKnownReadyController{
+					configMapLister: corev1listers.NewConfigMapLister(cmIndexer),
+				}
 
-			transport := http.DefaultTransport.(*http.Transport).Clone()
-			transport.TLSClientConfig.RootCAs = rootCAs
-			rt := http.RoundTripper(transport)
-			if tt.testRoundTripper != nil {
-				tt.testRoundTripper.delegate = transport
-				rt = tt.testRoundTripper
-			}
-
-			testURL, err := url.Parse(s.URL)
-			require.NoError(t, err)
-
-			testCtx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-			if err := c.checkWellknownEndpointReady(testCtx, testURL.Host, rt); (err != nil) != tt.wantErr {
-				t.Errorf("wellKnownReadyController.checkWellknownEndpointReady() error = %v, wantErr %v", err, tt.wantErr)
-			}
+				testCtx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				if err := c.checkWellknownEndpointReady(testCtx, "127.0.0.1:443", tt.rt); (err != nil) != tt.wantErr {
+					t.Errorf("wellKnownReadyController.checkWellknownEndpointReady() error = %v, wantErr %v", err, tt.wantErr)
+				}
+			})
 		})
 	}
 }

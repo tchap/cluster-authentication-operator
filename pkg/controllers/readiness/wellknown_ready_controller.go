@@ -14,7 +14,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cenkalti/backoff/v4"
 	"golang.org/x/sync/errgroup"
 
 	configv1 "github.com/openshift/api/config/v1"
@@ -28,7 +27,7 @@ import (
 	"github.com/openshift/cluster-authentication-operator/pkg/transport"
 	"github.com/openshift/library-go/pkg/controller/factory"
 	"github.com/openshift/library-go/pkg/operator/events"
-	"github.com/openshift/library-go/pkg/operator/resource/retry"
+	"github.com/openshift/library-go/pkg/operator/resource/endpointcheck"
 	"github.com/openshift/library-go/pkg/operator/v1helpers"
 
 	corev1 "k8s.io/api/core/v1"
@@ -82,7 +81,7 @@ type wellKnownReadyController struct {
 	retryInterval time.Duration
 	// attemptCount is the maximum number of fetch+check cycles.
 	// Defaults to defaultAttemptCount when unset.
-	attemptCount int
+	attemptCount uint64
 }
 
 const controllerName = "WellKnownReadyController"
@@ -289,8 +288,8 @@ func (c *wellKnownReadyController) checkWellknownEndpointReady(ctx context.Conte
 
 	var connError error
 	var resp *http.Response
-	checkFn := func() error {
-		reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	checkFn := func(ctx context.Context, retryTimeout time.Duration) error {
+		reqCtx, cancel := context.WithTimeout(ctx, retryTimeout)
 		defer cancel()
 
 		req := req.WithContext(reqCtx)
@@ -326,17 +325,19 @@ func (c *wellKnownReadyController) checkWellknownEndpointReady(ctx context.Conte
 		return nil
 	}
 
-	// Run checkFn given number of times. Getting a timeout from checkFn causes an immediate retry,
-	// we don't wait another retryInterval before performing the next check.
-	skippableBoff := retry.NewSkippableBackOff(backoff.NewConstantBackOff(retryInterval))
-	boff := backoff.WithContext(backoff.WithMaxRetries(skippableBoff, uint64(attempts-1)), ctx)
-	_ = backoff.Retry(func() error {
-		err := checkFn()
-		if errors.Is(err, context.DeadlineExceeded) {
-			skippableBoff.SkipNext()
-		}
-		return err
-	}, boff)
+	requestTimeout := c.requestTimeout
+	if requestTimeout == 0 {
+		requestTimeout = defaultRequestTimeout
+	}
+	retryInterval := c.retryInterval
+	if retryInterval == 0 {
+		retryInterval = defaultRetryInterval
+	}
+	attemptCount := c.attemptCount
+	if attemptCount == 0 {
+		attemptCount = defaultAttemptCount
+	}
+	return endpointcheck.Check(ctx, requestTimeout, retryInterval, attemptCount, checkFn)
 }
 
 func wellKnownRoundtripErrorHint(err error) string {
