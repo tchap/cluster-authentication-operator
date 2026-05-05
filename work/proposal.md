@@ -76,7 +76,7 @@ It implements the OAuth 2.0 Authorization Code flow:
 3. After the user authenticates, the IdP redirects back to `/callback/<provider>`.
 4. The OAuth Server **exchanges the authorization code for tokens** by calling the IdP's token endpoint (outbound HTTPS call).
 5. The OAuth Server **fetches user info and group membership** from the IdP's userinfo endpoint or API (outbound HTTPS call -- e.g., GitHub's `/user/orgs` and `/user/teams` APIs).
-6. The OAuth Server issues an OpenShift OAuth access token and stores it via the OAuth API Server.
+6. The OAuth Server issues an OpenShift OAuth access token -- an opaque string in the format `sha256~<random>` -- and stores its SHA256 hash as an `OAuthAccessToken` object in etcd via the OAuth API Server. This is the token that `oc login` saves to `~/.kube/config` and that is sent as `Authorization: Bearer sha256~...` on every subsequent API call. Because it is an opaque random string (not a JWT), every request requires the OAuth API Server to look it up in etcd to validate it (see below).
 
 Supported identity provider types: GitHub, GitLab, Google, OpenID Connect (generic OIDC), LDAP, HTPasswd, Basic Auth (remote), Keystone, and Request Header (external proxy-based auth).
 
@@ -87,9 +87,18 @@ The OAuth Server is the component with the **most outbound calls** to external I
 The OAuth API Server is the **storage and validation backend**. It runs in the `openshift-oauth-apiserver` namespace and serves the `oauth.openshift.io` API group. It is not user-facing -- other cluster components call it.
 
 Key responsibilities:
-- **Token storage** -- serves CRUD operations for `OAuthAccessToken`, `OAuthAuthorizeToken`, `OAuthClient`, and `OAuthClientAuthorization` resources stored in etcd.
-- **Token validation** -- the kube-apiserver uses a webhook to ask the OAuth API Server to validate OAuth tokens. This is an **internal** cluster call (KAS → OAuth API Server), not an external one, so it does not need proxy support.
-- **External OIDC mode** -- when the cluster is configured to use an external OIDC provider (instead of the built-in OAuth flow), the OAuth API Server takes on JWT validation directly. In this mode it needs to fetch OIDC discovery documents and JWKS (JSON Web Key Sets) from the external provider -- these are **outbound HTTPS calls** that need proxy support. Today, the OAuth API Server has **no proxy injection at all**, not even the cluster-wide proxy. This is a gap.
+
+- **Token storage** -- OpenShift OAuth tokens are **opaque random strings**, not JWTs. The OAuth Server generates 256 bits of random entropy per token, hashes the value with SHA256, and stores the hash as a Kubernetes `OAuthAccessToken` object in etcd (via the OAuth API Server's REST API). The user receives `sha256~<random>`; the plaintext is never stored. This design enables revocation (delete the object), inactivity timeouts (stateful tracking per token), and user-UID binding (detecting when a user is deleted and recreated with the same name). It also serves `OAuthAuthorizeToken`, `OAuthClient`, and `OAuthClientAuthorization` resources.
+
+- **Token validation (integrated OAuth)** -- because tokens are opaque, they cannot be validated cryptographically. Instead, the kube-apiserver calls the OAuth API Server via a **webhook** on every authenticated request. The flow:
+  1. User sends a request with `Authorization: Bearer sha256~<random>`.
+  2. KAS forwards a `TokenReview` to `https://<oauth-apiserver>/apis/oauth.openshift.io/v1/tokenreviews`.
+  3. The OAuth API Server recomputes `SHA256(<random>)`, looks up the matching `OAuthAccessToken` object in etcd, then runs a validation chain: expiration check, inactivity timeout check, and user-UID check.
+  4. If valid, it resolves the user's groups and returns the authenticated identity to KAS.
+
+  This webhook call is **internal** (KAS → OAuth API Server within the cluster), so it does not need proxy support.
+
+- **External OIDC mode** -- when the cluster is configured to use an external OIDC provider (instead of the built-in OAuth flow), the OAuth API Server takes on JWT validation directly. Unlike opaque tokens, JWTs *can* be validated cryptographically -- but the OAuth API Server still needs to fetch the provider's public keys (JWKS) and OIDC discovery documents from the external provider. These are **outbound HTTPS calls** that need proxy support. Today, the OAuth API Server has **no proxy injection at all**, not even the cluster-wide proxy. This is a gap (see Finding 1 in the Review Findings section).
 
 ### Key concepts
 
