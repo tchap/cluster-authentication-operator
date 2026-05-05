@@ -4,6 +4,117 @@
 **Date:** 2026-05-05
 **Status:** Draft
 
+## Background
+
+This section introduces the authentication architecture for readers who don't work with OpenShift auth day-to-day. It explains what each affected component does, how they relate to each other, and where external network calls happen -- the key concern for proxy support.
+
+### How OpenShift authentication works
+
+When a user runs `oc login` or opens the OpenShift console, the cluster needs to verify their identity. OpenShift supports many ways to do this -- corporate LDAP, GitHub accounts, Google, generic OIDC providers like Keycloak or Azure AD, and others. These are called **Identity Providers (IdPs)**.
+
+The authentication system has three main components, each running as a separate process in the cluster:
+
+```
+                        ┌─────────────────────────────────────────────────────┐
+                        │                   OpenShift Cluster                 │
+                        │                                                     │
+  User                  │  ┌───────────────────────────────────────────────┐  │
+  (oc login,            │  │  Cluster Authentication Operator (CAO)        │  │
+   console)             │  │  namespace: openshift-authentication-operator │  │
+       │                │  │                                               │  │
+       │                │  │  • Deploys and configures the other two       │  │
+       │                │  │  • Validates IdP configuration ───────────────│──│──► External IdP
+       │                │  │  • Syncs certificates and secrets             │  │    (OIDC discovery)
+       │                │  └───────────────────────────────────────────────┘  │
+       │                │                                                     │
+       │                │  ┌───────────────────────────────────────────────┐  │
+       ▼                │  │  OAuth Server                                 │  │
+  ┌──────────┐          │  │  namespace: openshift-authentication          │  │
+  │  Route   │──────────│─►│                                               │  │
+  │ (ingress)│          │  │  • Hosts /login, /oauth/authorize, /callback  │  │
+  └──────────┘          │  │  • Redirects user to external IdP ────────────│──│──► External IdP
+                        │  │  • Exchanges auth codes for tokens ───────────│──│──► External IdP
+                        │  │  • Fetches user info and group membership ────│──│──► External IdP
+                        │  │  • Issues OpenShift OAuth access tokens       │  │
+                        │  └───────────────────────────────────────────────┘  │
+                        │                                                     │
+                        │  ┌───────────────────────────────────────────────┐  │
+  kube-apiserver ──────►│  │  OAuth API Server                             │  │
+  (token validation     │  │  namespace: openshift-oauth-apiserver         │  │
+   webhook)             │  │                                               │  │
+                        │  │  • Stores OAuth tokens, clients, identities   │  │
+                        │  │  • Validates tokens on behalf of KAS          │  │
+                        │  │  • (External OIDC mode) fetches JWKS ─────────│──│──► External IdP
+                        │  │    from external provider for JWT validation  │  │
+                        │  └───────────────────────────────────────────────┘  │
+                        └─────────────────────────────────────────────────────┘
+```
+
+The arrows leaving the cluster boundary (►) are the **outbound calls that need proxy support** in disconnected environments.
+
+### Component descriptions
+
+#### Cluster Authentication Operator (CAO)
+
+The CAO is the **control plane** for the authentication subsystem. It is an OpenShift operator that deploys, configures, and monitors both the OAuth Server and the OAuth API Server. It runs in the `openshift-authentication-operator` namespace.
+
+Key responsibilities:
+- **Deploys operands** -- creates and updates the Deployment resources for the OAuth Server and OAuth API Server, injecting the correct images, flags, certificates, and environment variables.
+- **Observes configuration** -- watches the cluster's `OAuth` config resource (`oauth.config.openshift.io/cluster`) and translates IdP definitions into the format each operand expects. During this process, it makes **outbound OIDC discovery calls** to validate IdP endpoints (e.g., fetching `/.well-known/openid-configuration`).
+- **Syncs resources** -- copies secrets, ConfigMaps, and CA bundles from the `openshift-config` namespace (where admins place them) into the operand namespaces where they're consumed.
+- **Health checking** -- validates that OAuth routes are reachable, services have endpoints, proxy configuration is correct, and operands are healthy. Reports status via standard ClusterOperator conditions.
+
+The CAO itself makes outbound HTTP calls during config observation, which is why it also needs proxy support.
+
+#### OAuth Server
+
+The OAuth Server is the **user-facing authentication endpoint**. It runs in the `openshift-authentication` namespace as the `oauth-openshift` Deployment. Users interact with it (usually via browser redirect) when they log in.
+
+It implements the OAuth 2.0 Authorization Code flow:
+1. User is redirected to the OAuth Server's `/oauth/authorize` endpoint.
+2. The OAuth Server redirects the user to the external IdP's login page.
+3. After the user authenticates, the IdP redirects back to `/callback/<provider>`.
+4. The OAuth Server **exchanges the authorization code for tokens** by calling the IdP's token endpoint (outbound HTTPS call).
+5. The OAuth Server **fetches user info and group membership** from the IdP's userinfo endpoint or API (outbound HTTPS call -- e.g., GitHub's `/user/orgs` and `/user/teams` APIs).
+6. The OAuth Server issues an OpenShift OAuth access token and stores it via the OAuth API Server.
+
+Supported identity provider types: GitHub, GitLab, Google, OpenID Connect (generic OIDC), LDAP, HTPasswd, Basic Auth (remote), Keystone, and Request Header (external proxy-based auth).
+
+The OAuth Server is the component with the **most outbound calls** to external IdPs. It already receives cluster-wide proxy env vars today.
+
+#### OAuth API Server
+
+The OAuth API Server is the **storage and validation backend**. It runs in the `openshift-oauth-apiserver` namespace and serves the `oauth.openshift.io` API group. It is not user-facing -- other cluster components call it.
+
+Key responsibilities:
+- **Token storage** -- serves CRUD operations for `OAuthAccessToken`, `OAuthAuthorizeToken`, `OAuthClient`, and `OAuthClientAuthorization` resources stored in etcd.
+- **Token validation** -- the kube-apiserver uses a webhook to ask the OAuth API Server to validate OAuth tokens. This is an **internal** cluster call (KAS → OAuth API Server), not an external one, so it does not need proxy support.
+- **External OIDC mode** -- when the cluster is configured to use an external OIDC provider (instead of the built-in OAuth flow), the OAuth API Server takes on JWT validation directly. In this mode it needs to fetch OIDC discovery documents and JWKS (JSON Web Key Sets) from the external provider -- these are **outbound HTTPS calls** that need proxy support. Today, the OAuth API Server has **no proxy injection at all**, not even the cluster-wide proxy. This is a gap.
+
+### Key concepts
+
+**Identity Provider (IdP):** An external service that authenticates users (e.g., Azure AD, Keycloak, GitHub). The cluster trusts the IdP to verify user identity, and the IdP returns information about the user (name, email, group memberships) after successful authentication.
+
+**OIDC (OpenID Connect):** A protocol built on top of OAuth 2.0 that adds an identity layer. The IdP publishes a discovery document at `/.well-known/openid-configuration` listing its endpoints, and a JWKS document containing the public keys used to sign tokens. Clients (like our OAuth Server or OAuth API Server) fetch these documents to validate tokens. These fetches are outbound HTTPS calls.
+
+**OAuth 2.0 Authorization Code flow:** The standard browser-based login flow. The user's browser is redirected to the IdP, authenticates there, and is redirected back with a short-lived authorization code. The server then exchanges that code for tokens by making a direct server-to-server HTTPS call to the IdP -- this is the call that needs proxy support, since it originates from within the cluster.
+
+**Cluster-wide proxy (`proxy.config.openshift.io/cluster`):** OpenShift's global proxy configuration. When set, operators inject `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` environment variables into their operand pods. Go's standard library (`http.ProxyFromEnvironment`) picks these up automatically. The problem: this is all-or-nothing -- it opens egress for every component, not just auth.
+
+**Component-scoped proxy (what this proposal adds):** A proxy configuration that applies only to the three authentication components, without affecting anything else in the cluster. This is the core of OCPSTRAT-3174.
+
+### Where outbound calls happen -- summary
+
+| Outbound call | Component | Protocol | When it happens |
+|---|---|---|---|
+| OIDC discovery (`/.well-known/openid-configuration`) | CAO (config observation) | HTTPS | When IdP config is created or changed |
+| OIDC discovery + JWKS fetch | OAuth API Server (external OIDC mode) | HTTPS | At startup and periodically for key rotation |
+| Token exchange (auth code → access token) | OAuth Server | HTTPS | Every user login |
+| UserInfo / group membership fetch | OAuth Server | HTTPS | Every user login (OIDC, GitHub, GitLab, Google) |
+| LDAP bind and search | OAuth Server | LDAP/LDAPS | Every LDAP user login (not HTTP, not proxy-relevant) |
+
+All HTTP/HTTPS calls in this table are the ones that need proxy support. LDAP uses its own protocol and is out of scope for HTTP proxy configuration.
+
 ## Problem Statement
 
 Customers operating OpenShift in restricted or disconnected environments need their authentication components (OAuth server, OAuth API server, cluster-authentication-operator) to reach external Identity Providers (IdPs) through a proxy, **without** configuring a cluster-wide proxy. Today the only mechanism is the global `proxy.config.openshift.io/cluster` resource, which opens egress for *all* components -- an unacceptable security posture when only authentication needs external access.
