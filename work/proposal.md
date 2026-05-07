@@ -593,33 +593,185 @@ The proposal correctly identifies that the OAuth API Server's lack of cluster-wi
 
 This is correctly separated in the Implementation Order (steps 2 vs 4) but conflated in the Phase 2d implementation details.
 
-### Finding 8: Upgrade/downgrade behavior is not addressed (Low)
+### Finding 8: Upgrade/downgrade behavior — thorough analysis (Medium)
 
-If a cluster with `spec.proxy` configured is downgraded to a version without the feature:
-- The field is silently ignored by the older operator
-- Auth will break if no cluster-wide proxy exists and external IdP connectivity depends on the component proxy
-- There is no automatic fallback or warning
+The original concern was that `spec.proxy` might be silently ignored after a downgrade. After investigating CVO, the CRD schema, and the operator's dynamic client, the actual risk is more nuanced than initially stated.
 
-**Required action:** Document this as a known limitation. The feature gate graduation criteria should include upgrade/downgrade testing. Consider having the operator set a status condition when `spec.proxy` is configured, so that downgrade pre-flight checks can warn about it.
+#### What TechPreviewNoUpgrade means for this feature
+
+The feature gate `FeatureGateAuthenticationComponentProxy` starts as `TechPreviewNoUpgrade`. This has hard consequences:
+
+- **TechPreviewNoUpgrade is permanent and irrevocable.** Once a cluster enables it, the FeatureGate CRD has an XValidation rule (`oldSelf == 'TechPreviewNoUpgrade' ? self == 'TechPreviewNoUpgrade' : true`) that prevents changing back. The cluster is permanently locked.
+- **TechPreviewNoUpgrade prevents upgrades.** CVO blocks both minor and major version upgrades for clusters in this feature set.
+- **Z-stream rollbacks are the only allowed downgrade.** CVO's `ClusterVersionRollback` precondition allows rollback only to the immediate previous version within the same minor release (e.g., 4.18.3 → 4.18.2). Cross-minor downgrades are blocked.
+
+This means the downgrade scenario is constrained: a cluster using `spec.proxy` (gated behind TechPreviewNoUpgrade) can only z-stream rollback within the same minor version. It cannot upgrade to a newer minor version at all.
+
+#### What happens to `spec.proxy` during a z-stream rollback
+
+Three layers determine what happens to the field:
+
+1. **CRD schema pruning (API server level):** The Authentication CRD does NOT have `x-kubernetes-preserve-unknown-fields: true` on the `spec` object — only on `observedConfig` and `unsupportedConfigOverrides`. When CVO downgrades the CRD manifest to a version that doesn't define `spec.proxy`, the API server's structural schema pruning will **strip the `proxy` field from etcd** on the next write. Any read-modify-write cycle (by the operator or any other controller) will silently drop it.
+
+2. **CVO CRD update behavior:** CVO replaces the entire CRD spec during a payload apply (`EnsureCustomResourceDefinitionV1` in `lib/resourcemerge/apiext.go`). The downgraded CRD will not have the `proxy` field in its OpenAPI schema. After the CRD is downgraded, the API server will prune `proxy` from the CR on the next mutation.
+
+3. **Operator dynamic client behavior:** The older operator binary uses `runtime.DefaultUnstructuredConverter.FromUnstructured()` which silently ignores unknown fields. However, `setOperatorSpecFromUnstructured()` in library-go (`dynamic_operator_client.go:488-502`) attempts to **preserve unknown top-level spec fields** during updates:
+
+   ```go
+   origSpec, preExistingSpec, err := unstructured.NestedMap(obj, "spec")
+   if preExistingSpec {
+       flds := topLevelFields(*spec) // reflects known struct fields
+       for k, v := range origSpec {
+           if !flds[k] {              // unknown field
+               unstructured.SetNestedField(newSpec, v, k) // preserve it
+           }
+       }
+   }
+   ```
+
+   So the operator tries not to stomp unknown fields. But this is moot because the CRD schema pruning (layer 1) will strip the field regardless.
+
+#### The actual risk scenario
+
+```
+Timeline:
+1. Cluster on 4.18.3 with TechPreviewNoUpgrade enabled
+2. Admin sets Authentication.spec.proxy (field exists in 4.18.3 CRD schema)
+3. Auth works through component proxy; no cluster-wide proxy configured
+4. Z-stream rollback to 4.18.2 (which doesn't have the proxy field in the CRD)
+5. CVO applies 4.18.2 CRD → schema no longer includes spec.proxy
+6. Next operator sync does a read-modify-write → API server prunes spec.proxy from etcd
+7. Operator reads spec.proxy as nil → falls back to cluster-wide proxy → none configured
+8. Auth breaks: OAuth Server can't reach external IdP
+```
+
+The field doesn't just get "ignored" — it gets **permanently deleted** from the CR. The admin would need to re-apply the proxy configuration after upgrading back.
+
+#### Mitigations
+
+1. **The constrained blast radius is the primary mitigation.** TechPreviewNoUpgrade clusters cannot upgrade to newer minors, and z-stream rollbacks are rare. The audience is limited to clusters explicitly opting into tech preview.
+
+2. **The operator should set an `Upgradeable` condition when `spec.proxy` is configured.** Library-go's `Upgradeable=False` condition blocks minor/major upgrades (but not z-stream patches). This would prevent accidental upgrade attempts, and serves as documentation that the feature is in use. However, z-stream rollbacks bypass this check.
+
+3. **Document the z-stream rollback risk.** If `spec.proxy` is the only egress path, a z-stream rollback will break authentication. The admin must either:
+   - Configure a cluster-wide proxy as a fallback before rolling back
+   - Re-apply `spec.proxy` after upgrading back to the version that supports it
+
+4. **When the feature graduates to Default:** The field will be present in all CRD schemas for that minor version, so z-stream rollbacks within the same minor won't lose the field. The risk only exists during the TechPreview phase when the field is not universally present.
+
+### Finding 9: HyperShift (Hosted Control Planes) uses a completely different deployment model (Informational)
+
+HyperShift bypasses the cluster-authentication-operator entirely and manages auth components directly. This has significant implications for the proposal.
+
+#### How HyperShift deploys auth components
+
+In HyperShift, the control plane (including auth) runs in the **management cluster**, not in the hosted cluster. The deployment model is fundamentally different:
+
+| Aspect | Standalone OpenShift | HyperShift |
+|---|---|---|
+| Who deploys OAuth Server? | CAO (cluster-authentication-operator) | HyperShift control-plane-operator, directly |
+| Who deploys OAuth API Server? | CAO | HyperShift control-plane-operator, directly |
+| Does CAO run? | Yes, in `openshift-authentication-operator` | **No** -- explicitly excluded from CVO payload |
+| Where do auth pods run? | In the hosted cluster itself | In the management cluster's HCP namespace |
+| Proxy mechanism | Env vars from cluster-wide `Proxy` resource | Konnectivity tunneling + `HostedCluster.spec.configuration.proxy` |
+
+The CAO is excluded from the CVO payload in HyperShift (`control-plane-operator/controllers/hostedcontrolplane/v2/cvo/deployment.go`). Instead, the `HostedClusterConfigOperator` reconciles the `Authentication` CR directly in the hosted cluster.
+
+#### How HyperShift handles proxy for auth components
+
+HyperShift uses a **two-layer proxy architecture**:
+
+1. **Konnectivity sidecar** -- every auth pod gets a konnectivity container injected (`InjectKonnectivityContainer()`), providing SOCKS5 (port 8090) and HTTP CONNECT (port 8092) proxies for tunneling traffic between management and hosted clusters. The OAuth Server component requests dual-mode konnectivity:
+
+   ```go
+   // control-plane-operator/.../v2/oauth/component.go
+   InjectKonnectivityContainer(component.KonnectivityContainerOptions{
+       Mode: component.Dual,
+       Socks5Options: component.Socks5Options{
+           ResolveFromGuestClusterDNS:      ptr.To(true),
+           ResolveFromManagementClusterDNS: ptr.To(true),
+       },
+       HTTPSOptions: component.HTTPSOptions{
+           ServingPort:                httpKonnectivityProxyPort,
+           ConnectDirectlyToCloudAPIs: ptr.To(true),
+       },
+   })
+   ```
+
+2. **User-configured proxy from `HostedCluster.spec.configuration.proxy`** -- when a user configures a proxy on the HostedCluster, HyperShift reads it and applies it to auth transports. Notably, `idp_convert.go:683-754` in HyperShift already builds proxy-aware HTTP transports for OIDC discovery:
+
+   ```go
+   // control-plane-operator/.../v2/oauth/idp_convert.go
+   if proxy := hcp.Spec.Configuration.Proxy; proxy != nil {
+       userProxyConfig = &httpproxy.Config{
+           HTTPProxy:  proxy.HTTPProxy,
+           HTTPSProxy: proxy.HTTPSProxy,
+           NoProxy:    supportproxy.DefaultNoProxy(&hcp),
+       }
+   }
+   // ...
+   transport.Proxy = func(req *http.Request) (*url.URL, error) {
+       return userProxyFunc(req.URL)
+   }
+   ```
+
+   This is essentially what the proposal's Phase 2e proposes for the standalone CAO -- but HyperShift already has it.
+
+#### Impact on this proposal
+
+**The proposed `Authentication.spec.proxy` field would have no effect in HyperShift:**
+- The CAO does not run in HyperShift, so no code reads the field.
+- HyperShift deploys auth components directly and uses `HostedCluster.spec.configuration.proxy` for proxy configuration.
+- The `Authentication` operator CR exists in the hosted cluster (reconciled by the HostedClusterConfigOperator), but HyperShift would need a separate code change to read `spec.proxy` from it and thread it into its deployment logic.
+
+**This is acceptable for the initial scope.** The JIRA lists HCP as "TBD", and the proposal correctly focuses on standalone/SNO/compact topologies. However, the following should be documented:
+
+- If a HyperShift user sets `Authentication.spec.proxy` in the hosted cluster, it will be silently ignored. This should be validated and rejected with a clear error, or documented as unsupported.
+- To support HCP in the future, HyperShift would need a change in `control-plane-operator/.../v2/oauth/` to read the component-scoped proxy field (either from the hosted cluster's `Authentication` CR or from a new field on `HostedCluster.spec.configuration`). HyperShift already has the transport-level plumbing for proxy -- the gap is only in the API surface and wiring.
+- HyperShift's existing proxy support via `HostedCluster.spec.configuration.proxy` already covers the use case for HCP users, though it is **cluster-wide** within the hosted cluster scope (not component-scoped).
 
 ## Risks and Mitigations
+
+The following risks are compiled from code analysis (Findings 1-9 above) and from precedent in existing OpenShift enhancement proposals, particularly: [Global Cluster Egress Proxy](https://github.com/openshift/enhancements/blob/master/enhancements/proxy/global-cluster-egress-proxy.md), [Windows Node Egress Proxy](https://github.com/openshift/enhancements/blob/master/enhancements/windows-containers/windows-node-egress-proxy.md), [Direct External OIDC Provider](https://github.com/openshift/enhancements/blob/master/enhancements/authentication/direct-external-oidc-provider.md), [AuthConfig Missing Fields](https://github.com/openshift/enhancements/blob/master/enhancements/authentication/AuthConfig-missing-fields.md), and [IBM Service Endpoint Dynamic Override](https://github.com/openshift/enhancements/blob/master/enhancements/cloud-integration/ibm/service-endpoint-dynamic-override.md).
+
+### Implementation risks
 
 | Risk | Mitigation |
 |------|------------|
 | API change requires openshift/api PR and review cycle | Start with API PR early; operator changes can proceed in parallel using vendored types |
-| Proxy credentials in `httpProxy`/`httpsProxy` URLs could leak | Use Kubernetes Secrets for proxy auth (future enhancement); document security best practices; proxy URLs are already handled this way for cluster-wide proxy |
-| OAuth API Server currently has no proxy at all -- adding it could change behavior for existing clusters | Gate the OAuth API Server proxy injection behind the same resolution logic; when no proxy is configured, no env vars are set (no behavior change) |
-| CA bundle conflicts between component and cluster trust | Component `trustedCA` is merged with system trust, not replacing it; follows the same pattern as cluster-wide proxy CA |
-| Feature gate lifecycle management | Start as TechPreviewNoUpgrade; clear graduation criteria before promoting to Default |
 | Env var injection may not reach oauth-apiserver OIDC transport (see Finding 1) | Pass a proxy-configured `*http.Client` via `oidc.Options.Client` in the oauth-apiserver; env vars alone are insufficient |
 | No way to explicitly disable proxy for auth when cluster-wide proxy exists (see Finding 2) | Add a mechanism (e.g. boolean field or empty-struct semantics) to express "no proxy" intent |
-| Downgrade breaks auth if component proxy was the only egress path (see Finding 8) | Document as known limitation; add status condition for downgrade pre-flight checks |
+| CA bundle conflicts between component and cluster trust | Component `trustedCA` is merged with system trust, not replacing it; follows the same pattern as cluster-wide proxy CA |
+| OAuth API Server currently has no proxy at all -- adding it could change behavior for existing clusters | Gate the OAuth API Server proxy injection behind the same resolution logic; when no proxy is configured, no env vars are set (no behavior change) |
+| `Authentication.spec.proxy` is silently ignored in HyperShift (see Finding 9) | Document as unsupported on HCP; consider validation webhook to reject the field on HyperShift-managed clusters. HyperShift users should use `HostedCluster.spec.configuration.proxy` instead |
+
+### Operational risks
+
+| Risk | Mitigation |
+|------|------------|
+| **Cluster bricking from invalid proxy config** -- a misconfigured proxy URL can make the OAuth server unreachable, locking all users out. The Global Egress Proxy enhancement noted that proxy validation is "very limited, so this risk cannot be eliminated." | Extend `proxyconfig_controller.go` to validate connectivity through the component proxy to at least one configured IdP endpoint before applying. Report `ProxyConfigControllerDegraded` immediately on failure. Document recovery procedure (edit the `Authentication` CR via `kubeadmin` or client cert auth to remove `spec.proxy`). |
+| **Proxy as untrusted intermediary** -- a malicious or mis-pointed proxy could intercept authentication traffic (authorization codes, tokens, user info). This is a security-sensitive path. | Document that the proxy is in the trust path for all authentication traffic. The `trustedCA` field pins the proxy's TLS certificate, so MITM is detectable if the CA is correctly configured. Recommend that admins verify proxy identity before configuring. This is the same trust model as the cluster-wide proxy. |
+| **Network dependency in auth path** -- the proxy adds a network hop and a single point of failure. If the proxy is down, all authentication fails. The External OIDC enhancement noted that "authentication becomes dependent on external services being available." | The proxy is already a dependency for clusters that use the cluster-wide proxy today; this feature doesn't introduce a new class of failure, only a new configuration surface. Document that the proxy must be highly available. The operator should set `Degraded` conditions when the proxy is unreachable. |
+| **Debugging and support complexity** -- when the component proxy differs from the cluster proxy, support cases become harder to diagnose. The Windows Node Proxy enhancement highlighted "increased complexity and the potential complexity of debugging customer cases that involve a proxy setup." | Add the resolved proxy configuration (component vs. cluster) to the operator's status or as annotations on managed deployments, so `oc adm inspect` and must-gather capture which proxy is in effect. Document the resolution precedence clearly in troubleshooting guides. |
+| **Conflict between component and cluster-wide proxy** -- users must correctly reconcile `noProxy` settings between the two. The IBM Endpoint Override enhancement warned that customers must manually exclude overridden endpoints from the cluster proxy. | Validate that the component proxy's `noProxy` is a superset of essential cluster-internal CIDRs (service CIDR, pod CIDR, `.cluster.local`). Warn (via status condition) if the component `noProxy` is missing entries that the cluster-wide `noProxy` includes. |
+| **SNO disruption during proxy config rollout** -- HA clusters can tolerate a rolling restart, but SNO clusters will briefly lose their only OAuth server instance when the deployment restarts after a proxy config change. | This is the same behavior as any OAuth server config change on SNO today. Document that changing `spec.proxy` triggers a rolling restart and may cause a brief authentication outage on SNO. No additional mitigation needed beyond what exists. |
+
+### Lifecycle risks
+
+| Risk | Mitigation |
+|------|------------|
+| **Feature gate proliferation in the auth space** -- the auth operator already gates `ExternalOIDC`, `ExternalOIDCWithUIDAndExtraClaimMappings`, and `ExternalOIDCWithUpstreamParity`. Adding `AuthenticationComponentProxy` increases the test matrix and the risk of feature gate interaction bugs. | Ensure the new feature gate is orthogonal to the External OIDC gates (component proxy applies to both integrated OAuth and external OIDC paths). Add test coverage for the cross-product of `AuthenticationComponentProxy` × `ExternalOIDC` enabled/disabled. |
+| Feature gate lifecycle management | Start as TechPreviewNoUpgrade; clear graduation criteria before promoting to Default |
+| Z-stream rollback during TechPreview phase permanently deletes `spec.proxy` from etcd via CRD schema pruning, breaking auth if no cluster-wide proxy exists (see Finding 8) | Blast radius is limited to TechPreview clusters doing z-stream rollbacks. Set `Upgradeable=False` when `spec.proxy` is configured. Document that admins must configure a cluster-wide proxy fallback before rolling back. Risk disappears when the feature graduates to Default. |
+| **Limited CI validation during TechPreview** -- TechPreview features are not exercised in default CI runs. The OpenShift supportability guidelines note that "your feature will not be available in CI clusters unless you create your own specific CI job." | Create a dedicated periodic CI job that runs the E2E proxy tests on a TechPreview cluster with a deployed test proxy (e.g., Squid). This job must meet the graduation bar: 5+ tests, running 7+ times per week, 95%+ pass rate for 14+ days before branch cut. |
+| Proxy credentials in `httpProxy`/`httpsProxy` URLs could leak | Use Kubernetes Secrets for proxy auth (future enhancement); document security best practices; proxy URLs are already handled this way for cluster-wide proxy |
+| **Support scope creep** -- once component-scoped proxy exists for auth, users and other teams will expect the same for other operators (image-registry, machine-config, monitoring). The External OIDC UID enhancement noted that "users may expect that we support any configurations possible, even if explicitly stated otherwise." | Scope this feature explicitly to authentication only in documentation. The `operator.openshift.io/v1` resource pattern means other operators could independently adopt the same pattern, but this proposal does not create a framework -- it is a single-component solution. |
 
 ## Open Questions
 
 1. **Should proxy credentials be supported via a Secret reference?** The cluster-wide proxy embeds credentials in the URL. We could add an optional `proxyCredentials` SecretNameReference for improved security. This could be a follow-up enhancement.
 
-2. **HCP (Hosted Control Planes) support** is listed as TBD in the feature. The control plane components run in a different namespace/cluster in HCP. This proposal focuses on standalone/SNO/compact topologies first.
+2. **HCP (Hosted Control Planes) support** is listed as TBD in the feature. See Finding 9 for a detailed analysis. In short: the CAO does not run in HyperShift, so `Authentication.spec.proxy` would be silently ignored. HyperShift already has proxy support for auth via `HostedCluster.spec.configuration.proxy` and konnectivity tunneling, but it is cluster-wide, not component-scoped. Future HCP support would require a HyperShift-side change to either read the new field or add a parallel configuration path on HostedCluster. This proposal focuses on standalone/SNO/compact topologies first.
 
 3. **Should the operator validate proxy connectivity during configuration observation?** Currently `proxyconfig_controller.go` validates the cluster-wide proxy. The same validation should apply to the component proxy, but the validation target (IdP endpoints) may not be known at operator startup time.
 
