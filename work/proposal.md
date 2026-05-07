@@ -156,7 +156,7 @@ The implementation spans four repositories (`openshift/api`, `cluster-authentica
 
 ### Phase 2: Bug fix -- OAuth API Server cluster-wide proxy injection
 
-Independent bug fix that benefits all users regardless of the component-proxy feature gate.
+Independent bug fix that benefits all users regardless of the component-proxy feature gate. This gap exists because the OAuth API Server originally made no outbound calls -- in integrated OAuth mode it only does internal etcd lookups and responds to TokenReview webhooks from KAS. External OIDC (itself still feature-gated) changed that by requiring outbound JWKS and discovery fetches, but the proxy plumbing was not added when the feature was built.
 
 **Part A: Operator-side env var injection** (`pkg/operator/workload/sync_openshift_oauth_apiserver.go`)
 
@@ -178,24 +178,25 @@ if proxyConfig != nil {
 
 **Part B: oauth-apiserver code change** (`pkg/externaloidc/authenticator/jwt/config/configurator.go`)
 
-Env var injection alone is insufficient -- `configurator.go:182-186` constructs `oidc.Options{}` without an `*http.Client`. Build a proxy-aware client and pass it via `oidc.Options.Client`.
+Env var injection alone is insufficient. The function `TokenAuthenticatorForAuthenticationConfiguration` (lines 172-189) builds a `CAContentProvider` from the CA PEM and passes it alongside `JWTAuthenticator` in `oidc.Options`. No `Client` is set, so proxy support depends on the downstream k8s OIDC library's implicit fallback.
 
-`Client` and `CAContentProvider` are **mutually exclusive** in `oidc.Options`, so the CA must be embedded in the client's `TLSClientConfig`:
+**Change:** Build a proxy-aware `*http.Client` with the CA embedded in its `TLSClientConfig`, and pass it via `oidc.Options.Client` instead of `CAContentProvider`. `Client` and `CAContentProvider` are **mutually exclusive** in `oidc.Options`.
 
 ```go
-var tlsConfig *tls.Config
+tlsCfg := &tls.Config{}
 if len(jwt.Issuer.CertificateAuthority) > 0 {
-    roots := x509.NewCertPool()
-    roots.AppendCertsFromPEM([]byte(jwt.Issuer.CertificateAuthority))
-    tlsConfig = &tls.Config{RootCAs: roots}
-} else {
-    tlsConfig = &tls.Config{}
+    roots, err := certutil.NewPoolFromBytes([]byte(jwt.Issuer.CertificateAuthority))
+    if err != nil {
+        return nil, fmt.Errorf("loading CA bundle: %w", err)
+    }
+    tlsCfg.RootCAs = roots
 }
 
 httpClient := &http.Client{
-    Transport: knet.SetTransportDefaults(&http.Transport{
-        TLSClientConfig: tlsConfig,
+    Transport: utilnet.SetTransportDefaults(&http.Transport{
+        TLSClientConfig: tlsCfg,
     }),
+    Timeout: 30 * time.Second,
 }
 
 tokenAuthenticator, err := oidc.New(ctx, oidc.Options{
@@ -204,6 +205,13 @@ tokenAuthenticator, err := oidc.New(ctx, oidc.Options{
     Compiler:         compiler,
 })
 ```
+
+What this does:
+- `utilnet.SetTransportDefaults` wires up the CIDR-aware `ProxyFromEnvironment` wrapper, default dial settings, and HTTP/2 -- making the component respect `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` env vars explicitly.
+- `certutil.NewPoolFromBytes` returns an error on invalid PEM (unlike `AppendCertsFromPEM` which silently ignores it).
+- `Timeout: 30 * time.Second` matches the upstream k8s OIDC default.
+
+**Import changes:** add `"crypto/tls"`, `"net/http"`, `utilnet "k8s.io/apimachinery/pkg/util/net"`, `certutil "k8s.io/client-go/util/cert"`; remove unused `"k8s.io/apiserver/pkg/server/dynamiccertificates"` and `k8soidc`.
 
 ### Phase 3: Component-scoped proxy (cluster-authentication-operator)
 
@@ -251,12 +259,67 @@ func ResolveProxyConfig(
 
 #### 3b. Trusted CA bundle syncing
 
-When `spec.proxy.trustedCA` is set:
-1. Sync the referenced ConfigMap from `openshift-config` to `openshift-authentication`, `openshift-oauth-apiserver`, and `openshift-authentication-operator`.
-2. Mount it into OAuth Server and OAuth API Server deployments.
-3. Append to system trust (PEM concatenation, don't replace). Follows the cluster-wide proxy CA pattern.
+**How the cluster-wide proxy CA works today:** The cluster-network-operator's CA bundle injector watches for ConfigMaps labeled `config.openshift.io/inject-trusted-cabundle: "true"` and populates their `ca-bundle.crt` key with system trust + cluster-wide proxy CA already merged. The OAuth Server (`bindata/oauth-openshift/deployment.yaml:62-64`) and OAuth API Server (`bindata/oauth-apiserver/deploy.yaml:61-64`) mount these ConfigMaps and their entrypoints copy the bundle to the system trust path:
 
-Changes in `pkg/operator/starter.go`: wire the Authentication operator lister, add informer watches, extend resource sync controller.
+```bash
+cp -f .../ca-bundle.crt /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
+```
+
+The component-scoped `trustedCA` ConfigMap is admin-provided and won't be processed by the CA bundle injector (no label), so the operator must handle merging.
+
+**When `spec.proxy.trustedCA` is set**, the component CA must be merged with the existing trust chain (system trust + cluster-wide proxy CA). Two approaches are under consideration:
+
+**Option A: Entrypoint append.** Sync the component CA ConfigMap as-is, mount it as an additional volume, and extend the container entrypoint to concatenate it after the existing system trust copy:
+
+1. **Sync** the referenced ConfigMap from `openshift-config` to all three operand namespaces via the resource sync controller (same pattern as other config syncs in `starter.go`).
+
+2. **Mount** it as an additional volume in the OAuth Server and OAuth API Server deployments (e.g., at `/var/config/system/configmaps/auth-proxy-ca`).
+
+3. **Append to system trust** by extending the container entrypoints:
+
+    ```bash
+    if [ -s /var/config/system/configmaps/auth-proxy-ca/ca-bundle.crt ]; then
+        cat /var/config/system/configmaps/auth-proxy-ca/ca-bundle.crt \
+            >> /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
+    fi
+    ```
+
+    This runs after the existing `cp -f` of the injected system trust bundle, so the result is system trust + cluster-wide proxy CA + component-scoped proxy CA.
+
+4. **CAO process**: load the component CA into the cert pool in `TransportForCARefWithProxy()` (Phase 3e) and in the proxy validation controller's `getCACerts()` (which already uses `AppendCertsFromPEM` to load from a configurable set of ConfigMaps).
+
+5. **Deployment hash tracking**: include the component CA ConfigMap's ResourceVersion so changes trigger rollouts. The OAuth Server controller already watches all `v4-0-config-*` ConfigMaps by prefix (`deployment_controller.go:304`); add the component CA ConfigMap to that set. The OAuth API Server controller uses `resourcehash` for `trusted-ca-bundle` (`sync_openshift_oauth_apiserver.go:291`) -- add the component CA ConfigMap there too.
+
+Files to change: `starter.go` (resource sync), `bindata/oauth-openshift/deployment.yaml` (volume/mount + entrypoint), `bindata/oauth-apiserver/deploy.yaml` and `externaloidc-deploy.yaml` (same), `deployment_controller.go` (hash tracking), `sync_openshift_oauth_apiserver.go` (resourcehash).
+
+**Option B: Server-side merge.** The operator reads both the injected system trust ConfigMap and the component CA, concatenates the PEM content, and writes a pre-merged ConfigMap to each operand namespace. Pods get a single ConfigMap with everything already merged -- no entrypoint or volume mount changes.
+
+1. **Sync** the component CA ConfigMap from `openshift-config` to the operator namespace (for reading).
+
+2. **Merge controller**: extend the `trustdistribution` controller (which already does PEM read/filter/write in `trustdistribution_controller.go:97-105`) or create a new controller that:
+   - Reads the injected system trust ConfigMap (e.g., `v4-0-config-system-trusted-ca-bundle` in `openshift-authentication`, `trusted-ca-bundle` in `openshift-oauth-apiserver`)
+   - Reads the synced component CA ConfigMap
+   - Concatenates PEM bundles
+   - Writes the result to a new ConfigMap (e.g., `merged-trusted-ca-bundle`) in each operand namespace
+   - Must not write back to the injected ConfigMap -- the CA bundle injector would overwrite it
+
+3. **Update deployment volumes** to reference the merged ConfigMap instead of the injected one. No entrypoint changes needed -- the existing `cp -f` picks up the merged bundle.
+
+4. **CAO process**: same as Option A (load component CA in cert pools).
+
+5. **Watch both sources**: re-merge and trigger rollout when either the injected bundle or the component CA changes.
+
+Files to change: `starter.go` (resource sync + merge controller wiring), `trustdistribution_controller.go` or new controller (merge logic), deployment YAMLs (volume source name only), `deployment_controller.go` and `sync_openshift_oauth_apiserver.go` (hash tracking for merged ConfigMap).
+
+**Tradeoffs:**
+
+| | Option A: Entrypoint append | Option B: Server-side merge |
+|---|---|---|
+| Entrypoint changes | Yes | No |
+| Deployment YAML changes | Add volume/mount + entrypoint | Change volume source name |
+| New controller code | No | Yes -- reconciliation loop |
+| Failure mode | Straightforward -- pod has both files or it doesn't | Must handle ordering: merged ConfigMap must be ready before pod starts; changes to either source must trigger re-merge then rollout |
+| Existing pattern in repo | Entrypoint `cp -f` already exists | `trustdistribution_controller.go` already does PEM processing |
 
 #### 3c. OAuth Server deployment injection
 
