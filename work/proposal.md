@@ -1,12 +1,12 @@
 # Implementation Proposal: Proxy Support for Authentication Resources in Disconnected Environments
 
 **JIRA:** [OCPSTRAT-3174](https://redhat.atlassian.net/browse/OCPSTRAT-3174)
-**Date:** 2026-05-07
+**Date:** 2026-05-11
 **Status:** Draft
 
 ## Background
 
-OpenShift authentication has three components that make outbound calls to external Identity Providers (IdPs). In disconnected environments, these calls must go through a proxy -- but today the only mechanism is the cluster-wide `proxy.config.openshift.io/cluster`, which opens egress for *all* components.
+OpenShift authentication has two components that make outbound calls to external Identity Providers (IdPs): the Cluster Authentication Operator and the OAuth Server. In disconnected environments, these calls must go through a proxy -- but today the only mechanism is the cluster-wide `proxy.config.openshift.io/cluster`, which opens egress for *all* components.
 
 ```
                         ┌─────────────────────────────────────────────────────┐
@@ -38,8 +38,6 @@ OpenShift authentication has three components that make outbound calls to extern
    webhook)             │  │                                               │  │
                         │  │  • Stores OAuth tokens, clients, identities   │  │
                         │  │  • Validates tokens on behalf of KAS          │  │
-                        │  │  • (External OIDC mode) fetches JWKS ─────────│──│──► External IdP
-                        │  │    from external provider for JWT validation  │  │
                         │  └───────────────────────────────────────────────┘  │
                         └─────────────────────────────────────────────────────┘
 ```
@@ -52,14 +50,13 @@ The arrows leaving the cluster boundary (►) are the outbound calls that need p
 
 **OAuth Server** (`oauth-openshift` Deployment) -- the user-facing authentication endpoint. Implements OAuth 2.0 Authorization Code flow: redirects users to the external IdP, exchanges auth codes for tokens, fetches user info and group membership (GitHub orgs/teams, OIDC userinfo claims). Supports GitHub, GitLab, Google, OIDC, LDAP, HTPasswd, Basic Auth, Keystone, and Request Header IdPs. The component with the most outbound calls. Uses `knet.SetTransportDefaults()` → `http.ProxyFromEnvironment`, so it picks up proxy env vars automatically.
 
-**OAuth API Server** -- the storage and validation backend. Stores opaque OAuth tokens (`sha256~<random>` hashed with SHA256) as `OAuthAccessToken` objects in etcd. Validates tokens via webhook from kube-apiserver (internal, no proxy needed). In **External OIDC mode**, fetches JWKS and discovery documents from the external provider -- these outbound calls **have no proxy support today** (see Gaps below).
+**OAuth API Server** -- the storage and validation backend. Stores opaque OAuth tokens (`sha256~<random>` hashed with SHA256) as `OAuthAccessToken` objects in etcd. Validates tokens via webhook from kube-apiserver (internal, no proxy needed). In **External OIDC mode** (itself still feature-gated), the OAuth API Server can fetch JWKS and discovery documents from external providers, but this egress path is gated behind the `external-oidc` subcommand and is **out of scope** for this proposal -- proxy support for it can be added when External OIDC graduates.
 
 ### Where outbound calls happen
 
 | Outbound call | Component | When | Proxy today |
 |---|---|---|---|
 | OIDC discovery | CAO | IdP config change | `net.SetTransportDefaults()` (process env vars; no component-scoped override) |
-| OIDC discovery + JWKS | OAuth API Server (external OIDC) | Startup + key rotation | **None -- no proxy env vars injected** |
 | Token exchange | OAuth Server | Every login | `knet.SetTransportDefaults()` (env vars) |
 | UserInfo / groups | OAuth Server | Every login | `knet.SetTransportDefaults()` (env vars) |
 | LDAP bind/search | OAuth Server | LDAP login | LDAP protocol (not HTTP; out of scope) |
@@ -71,9 +68,7 @@ Customers in restricted environments need auth components to reach external IdPs
 ### Identified gaps
 
 1. **No component-scoped proxy API** -- the only proxy source is the cluster-wide `Proxy` resource.
-2. **OAuth API Server has no proxy injection at all** -- neither `syncStandardDeployment()` nor `syncExternalOIDCDeployment()` inject proxy env vars. This is a gap even for cluster-wide proxy users.
-3. **OAuth API Server OIDC transport ignores env vars** -- even if env vars were injected, `configurator.go:182-186` constructs `oidc.Options{}` without passing an `*http.Client`. The `oidc.Options.Client` field exists and is threaded through to the upstream K8s OIDC authenticator, but is not used. The API types document: "Note that egress selection configuration is not used for this network connection."
-4. **CAO and transport layer have no component-scoped proxy override** -- `transport.TransportForCARef()` delegates to `net.SetTransportDefaults()`, which **does** set `Proxy = http.ProxyFromEnvironment` -- so the transport respects proxy env vars injected by CVO from the cluster-wide proxy. But there is no mechanism to override these with component-scoped settings. When no cluster-wide proxy is configured, there are no env vars to read.
+2. **CAO and transport layer have no component-scoped proxy override** -- `transport.TransportForCARef()` delegates to `net.SetTransportDefaults()`, which **does** set `Proxy = http.ProxyFromEnvironment` -- so the transport respects proxy env vars injected by CVO from the cluster-wide proxy. But there is no mechanism to override these with component-scoped settings. When no cluster-wide proxy is configured, there are no env vars to read.
 
 ## Design
 
@@ -88,7 +83,7 @@ type AuthenticationSpec struct {
     OperatorSpec `json:",inline"`
 
     // proxy configures proxy settings specifically for authentication
-    // components (OAuth server, OAuth API server, and the operator itself).
+    // components (OAuth server and the operator itself).
     // When set, these values override the cluster-wide proxy for
     // authentication operands. When unset, the cluster-wide proxy (if any)
     // is used as today.
@@ -145,7 +140,7 @@ The resolution function handles three states. A non-nil but empty `Proxy` struct
 
 ## Implementation Plan
 
-The implementation spans four repositories (`openshift/api`, `cluster-authentication-operator`, `oauth-apiserver`, `oauth-server`) and is broken into phases.
+The implementation spans two repositories (`openshift/api`, `cluster-authentication-operator`) and is broken into phases.
 
 ### Phase 1: API changes (`openshift/api`)
 
@@ -154,66 +149,7 @@ The implementation spans four repositories (`openshift/api`, `cluster-authentica
 - `config/v1/feature_gates.go` -- add `FeatureGateAuthenticationComponentProxy` (TechPreviewNoUpgrade)
 - Add CRD validation markers for URL format, noProxy format
 
-### Phase 2: Bug fix -- OAuth API Server cluster-wide proxy injection
-
-Independent bug fix that benefits all users regardless of the component-proxy feature gate. This gap exists because the OAuth API Server originally made no outbound calls -- in integrated OAuth mode it only does internal etcd lookups and responds to TokenReview webhooks from KAS. External OIDC (itself still feature-gated) changed that by requiring outbound JWKS and discovery fetches, but the proxy plumbing was not added when the feature was built.
-
-**Part A: Operator-side env var injection** (`pkg/operator/workload/sync_openshift_oauth_apiserver.go`)
-
-Add proxy env var injection to both `syncStandardDeployment()` and `syncExternalOIDCDeployment()`, using the cluster-wide proxy only (no feature gate needed):
-
-```go
-proxyConfig, _ := c.proxyLister.Get("cluster")
-if proxyConfig != nil {
-    for i := range required.Spec.Template.Spec.Containers {
-        required.Spec.Template.Spec.Containers[i].Env = append(
-            required.Spec.Template.Spec.Containers[i].Env,
-            proxyEnvVars(proxyConfig.Status.HTTPProxy,
-                         proxyConfig.Status.HTTPSProxy,
-                         proxyConfig.Status.NoProxy)...,
-        )
-    }
-}
-```
-
-**Part B: oauth-apiserver code change** (`pkg/externaloidc/authenticator/jwt/config/configurator.go`)
-
-Env var injection alone is insufficient. The function `TokenAuthenticatorForAuthenticationConfiguration` (lines 172-189) builds a `CAContentProvider` from the CA PEM and passes it alongside `JWTAuthenticator` in `oidc.Options`. No `Client` is set, so proxy support depends on the downstream k8s OIDC library's implicit fallback.
-
-**Change:** Build a proxy-aware `*http.Client` with the CA embedded in its `TLSClientConfig`, and pass it via `oidc.Options.Client` instead of `CAContentProvider`. `Client` and `CAContentProvider` are **mutually exclusive** in `oidc.Options`.
-
-```go
-tlsCfg := &tls.Config{}
-if len(jwt.Issuer.CertificateAuthority) > 0 {
-    roots, err := certutil.NewPoolFromBytes([]byte(jwt.Issuer.CertificateAuthority))
-    if err != nil {
-        return nil, fmt.Errorf("loading CA bundle: %w", err)
-    }
-    tlsCfg.RootCAs = roots
-}
-
-httpClient := &http.Client{
-    Transport: utilnet.SetTransportDefaults(&http.Transport{
-        TLSClientConfig: tlsCfg,
-    }),
-    Timeout: 30 * time.Second,
-}
-
-tokenAuthenticator, err := oidc.New(ctx, oidc.Options{
-    JWTAuthenticator: jwt,
-    Client:           httpClient,
-    Compiler:         compiler,
-})
-```
-
-What this does:
-- `utilnet.SetTransportDefaults` wires up the CIDR-aware `ProxyFromEnvironment` wrapper, default dial settings, and HTTP/2 -- making the component respect `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` env vars explicitly.
-- `certutil.NewPoolFromBytes` returns an error on invalid PEM (unlike `AppendCertsFromPEM` which silently ignores it).
-- `Timeout: 30 * time.Second` matches the upstream k8s OIDC default.
-
-**Import changes:** add `"crypto/tls"`, `"net/http"`, `utilnet "k8s.io/apimachinery/pkg/util/net"`, `certutil "k8s.io/client-go/util/cert"`; remove unused `"k8s.io/apiserver/pkg/server/dynamiccertificates"` and `k8soidc`.
-
-### Phase 3: Component-scoped proxy (cluster-authentication-operator)
+### Phase 2: Component-scoped proxy (cluster-authentication-operator)
 
 All code paths guarded by `FeatureGateAuthenticationComponentProxy`.
 
@@ -234,7 +170,7 @@ proxy := authOperator.Spec.Proxy
 
 Each controller needing proxy config must be wired with this lister in `starter.go`.
 
-#### 3a. Proxy resolution helper
+#### 2a. Proxy resolution helper
 
 New file: `pkg/controllers/common/proxy.go`
 
@@ -257,9 +193,9 @@ func ResolveProxyConfig(
 }
 ```
 
-#### 3b. Trusted CA bundle syncing
+#### 2b. Trusted CA bundle syncing
 
-**How the cluster-wide proxy CA works today:** The cluster-network-operator's CA bundle injector watches for ConfigMaps labeled `config.openshift.io/inject-trusted-cabundle: "true"` and populates their `ca-bundle.crt` key with system trust + cluster-wide proxy CA already merged. The OAuth Server (`bindata/oauth-openshift/deployment.yaml:62-64`) and OAuth API Server (`bindata/oauth-apiserver/deploy.yaml:61-64`) mount these ConfigMaps and their entrypoints copy the bundle to the system trust path:
+**How the cluster-wide proxy CA works today:** The cluster-network-operator's CA bundle injector watches for ConfigMaps labeled `config.openshift.io/inject-trusted-cabundle: "true"` and populates their `ca-bundle.crt` key with system trust + cluster-wide proxy CA already merged. The OAuth Server (`bindata/oauth-openshift/deployment.yaml:62-64`) mounts this ConfigMap and the entrypoint copies the bundle to the system trust path:
 
 ```bash
 cp -f .../ca-bundle.crt /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
@@ -271,11 +207,11 @@ The component-scoped `trustedCA` ConfigMap is admin-provided and won't be proces
 
 **Option A: Entrypoint append.** Sync the component CA ConfigMap as-is, mount it as an additional volume, and extend the container entrypoint to concatenate it after the existing system trust copy:
 
-1. **Sync** the referenced ConfigMap from `openshift-config` to all three operand namespaces via the resource sync controller (same pattern as other config syncs in `starter.go`).
+1. **Sync** the referenced ConfigMap from `openshift-config` to the operand namespace and operator namespace via the resource sync controller (same pattern as other config syncs in `starter.go`).
 
-2. **Mount** it as an additional volume in the OAuth Server and OAuth API Server deployments (e.g., at `/var/config/system/configmaps/auth-proxy-ca`).
+2. **Mount** it as an additional volume in the OAuth Server deployment (e.g., at `/var/config/system/configmaps/auth-proxy-ca`).
 
-3. **Append to system trust** by extending the container entrypoints:
+3. **Append to system trust** by extending the container entrypoint:
 
     ```bash
     if [ -s /var/config/system/configmaps/auth-proxy-ca/ca-bundle.crt ]; then
@@ -286,21 +222,21 @@ The component-scoped `trustedCA` ConfigMap is admin-provided and won't be proces
 
     This runs after the existing `cp -f` of the injected system trust bundle, so the result is system trust + cluster-wide proxy CA + component-scoped proxy CA.
 
-4. **CAO process**: load the component CA into the cert pool in `TransportForCARefWithProxy()` (Phase 3e) and in the proxy validation controller's `getCACerts()` (which already uses `AppendCertsFromPEM` to load from a configurable set of ConfigMaps).
+4. **CAO process**: load the component CA into the cert pool in `TransportForCARefWithProxy()` (Phase 2d) and in the proxy validation controller's `getCACerts()` (which already uses `AppendCertsFromPEM` to load from a configurable set of ConfigMaps).
 
-5. **Deployment hash tracking**: include the component CA ConfigMap's ResourceVersion so changes trigger rollouts. The OAuth Server controller already watches all `v4-0-config-*` ConfigMaps by prefix (`deployment_controller.go:304`); add the component CA ConfigMap to that set. The OAuth API Server controller uses `resourcehash` for `trusted-ca-bundle` (`sync_openshift_oauth_apiserver.go:291`) -- add the component CA ConfigMap there too.
+5. **Deployment hash tracking**: include the component CA ConfigMap's ResourceVersion so changes trigger rollouts. The OAuth Server controller already watches all `v4-0-config-*` ConfigMaps by prefix (`deployment_controller.go:304`); add the component CA ConfigMap to that set.
 
-Files to change: `starter.go` (resource sync), `bindata/oauth-openshift/deployment.yaml` (volume/mount + entrypoint), `bindata/oauth-apiserver/deploy.yaml` and `externaloidc-deploy.yaml` (same), `deployment_controller.go` (hash tracking), `sync_openshift_oauth_apiserver.go` (resourcehash).
+Files to change: `starter.go` (resource sync), `bindata/oauth-openshift/deployment.yaml` (volume/mount + entrypoint), `deployment_controller.go` (hash tracking).
 
-**Option B: Server-side merge.** The operator reads both the injected system trust ConfigMap and the component CA, concatenates the PEM content, and writes a pre-merged ConfigMap to each operand namespace. Pods get a single ConfigMap with everything already merged -- no entrypoint or volume mount changes.
+**Option B: Server-side merge.** The operator reads both the injected system trust ConfigMap and the component CA, concatenates the PEM content, and writes a pre-merged ConfigMap to the operand namespace. Pods get a single ConfigMap with everything already merged -- no entrypoint or volume mount changes.
 
 1. **Sync** the component CA ConfigMap from `openshift-config` to the operator namespace (for reading).
 
 2. **Merge controller**: extend the `trustdistribution` controller (which already does PEM read/filter/write in `trustdistribution_controller.go:97-105`) or create a new controller that:
-   - Reads the injected system trust ConfigMap (e.g., `v4-0-config-system-trusted-ca-bundle` in `openshift-authentication`, `trusted-ca-bundle` in `openshift-oauth-apiserver`)
+   - Reads the injected system trust ConfigMap (e.g., `v4-0-config-system-trusted-ca-bundle` in `openshift-authentication`)
    - Reads the synced component CA ConfigMap
    - Concatenates PEM bundles
-   - Writes the result to a new ConfigMap (e.g., `merged-trusted-ca-bundle`) in each operand namespace
+   - Writes the result to a new ConfigMap (e.g., `merged-trusted-ca-bundle`) in the operand namespace
    - Must not write back to the injected ConfigMap -- the CA bundle injector would overwrite it
 
 3. **Update deployment volumes** to reference the merged ConfigMap instead of the injected one. No entrypoint changes needed -- the existing `cp -f` picks up the merged bundle.
@@ -309,7 +245,7 @@ Files to change: `starter.go` (resource sync), `bindata/oauth-openshift/deployme
 
 5. **Watch both sources**: re-merge and trigger rollout when either the injected bundle or the component CA changes.
 
-Files to change: `starter.go` (resource sync + merge controller wiring), `trustdistribution_controller.go` or new controller (merge logic), deployment YAMLs (volume source name only), `deployment_controller.go` and `sync_openshift_oauth_apiserver.go` (hash tracking for merged ConfigMap).
+Files to change: `starter.go` (resource sync + merge controller wiring), `trustdistribution_controller.go` or new controller (merge logic), `deployment.yaml` (volume source name only), `deployment_controller.go` (hash tracking for merged ConfigMap).
 
 **Tradeoffs:**
 
@@ -321,7 +257,7 @@ Files to change: `starter.go` (resource sync + merge controller wiring), `trustd
 | Failure mode | Straightforward -- pod has both files or it doesn't | Must handle ordering: merged ConfigMap must be ready before pod starts; changes to either source must trigger re-merge then rollout |
 | Existing pattern in repo | Entrypoint `cp -f` already exists | `trustdistribution_controller.go` already does PEM processing |
 
-#### 3c. OAuth Server deployment injection
+#### 2c. OAuth Server deployment injection
 
 **`pkg/controllers/deployment/default_deployment.go`** -- change `getOAuthServerDeployment()` to accept resolved proxy strings instead of `*configv1.Proxy`:
 
@@ -345,19 +281,7 @@ resourceVersions = append(resourceVersions,
     "auth-proxy:"+httpProxy+":"+httpsProxy+":"+noProxy)
 ```
 
-#### 3d. OAuth API Server deployment injection
-
-Extend Phase 2 to use `ResolveProxyConfig()` when feature gate is enabled:
-
-```go
-if featureGates.Enabled(features.FeatureGateAuthenticationComponentProxy) {
-    httpProxy, httpsProxy, noProxy = common.ResolveProxyConfig(authSpec, clusterProxy)
-} else {
-    // Phase 2 behavior: cluster-wide proxy only
-}
-```
-
-#### 3e. Operator process proxy configuration
+#### 2d. Operator process proxy configuration
 
 The CAO makes outbound OIDC discovery calls in `discoverOpenIDURLs()` (`idp_conversions.go:315`) via `transport.TransportForCARef()`. This delegates to `net.SetTransportDefaults()`, which sets `Proxy = http.ProxyFromEnvironment` -- so it respects env vars from the cluster-wide proxy. To support component-scoped proxy, add a variant that **overrides** the env-var-based proxy:
 
@@ -380,7 +304,7 @@ func TransportForCARefWithProxy(
 
 **`pkg/controllers/configobservation/oauth/idp_conversions.go`** -- update `discoverOpenIDURLs()` to accept and use proxy configuration via the `AuthenticationLister`. If the component-scoped `trustedCA` is set, load that CA from the synced ConfigMap in `openshift-authentication-operator`.
 
-#### 3f. Proxy validation controller
+#### 2e. Proxy validation controller
 
 **`pkg/controllers/proxyconfig/proxyconfig_controller.go`**
 
@@ -392,11 +316,11 @@ Extend to validate the component-scoped proxy:
 - Load CA from the component-scoped `trustedCA` ConfigMap
 - Validate that `noProxy` includes essential cluster-internal CIDRs; warn if entries from cluster-wide `noProxy` are missing
 
-#### 3g. Upgradeable condition
+#### 2f. Upgradeable condition
 
 Set `Upgradeable=False` on the ClusterOperator when `spec.proxy` is configured. Prevents accidental upgrades during TechPreview.
 
-### Phase 4: Testing
+### Phase 3: Testing
 
 **Unit tests:**
 - `proxy_test.go` -- resolution precedence (component > cluster > none), explicit disable
@@ -410,7 +334,6 @@ Set `Upgradeable=False` on the ClusterOperator when `spec.proxy` is configured. 
 - Test fallback (remove component proxy → cluster-wide proxy used)
 - Test explicit disable (`proxy: {}` → no proxy even with cluster-wide)
 - Test error reporting (invalid proxy → degraded condition)
-- Test feature gate cross-product: `AuthenticationComponentProxy` × `ExternalOIDC`
 
 **CI:** Dedicated periodic job on a TechPreview cluster. Graduation bar: 5+ tests, 7+/week, 95%+ pass rate for 14+ days.
 
@@ -435,13 +358,15 @@ The referenced ConfigMap must exist in `openshift-config` with key `ca-bundle.cr
 
 **Status reporting:** `ProxyConfigControllerDegraded` when proxy is unreachable. `Upgradeable=False` during TechPreview. Resolved proxy config surfaced in operator status / deployment annotations for `oc adm inspect` / must-gather.
 
-**Backward compatibility:** When `spec.proxy` is `nil`, behavior is identical to today. The OAuth API Server proxy injection (Phase 2) is a bug fix -- when no proxy is configured, no env vars are set.
+**Backward compatibility:** When `spec.proxy` is `nil`, behavior is identical to today.
 
 ## Scope and Topology
 
 **Supported:** Standalone OpenShift (multi-node, compact, SNO), restricted/disconnected networks.
 
-**HyperShift (Hosted Control Planes) -- not supported initially.** The CAO does not run in HyperShift (explicitly excluded from CVO payload). Auth pods run in the management cluster's HCP namespace. HyperShift already has proxy support via `HostedCluster.spec.configuration.proxy` and konnectivity sidecar injection (`InjectKonnectivityContainer()` with dual SOCKS5/HTTP CONNECT mode). HyperShift's `idp_convert.go:683-754` already builds proxy-aware HTTP transports for OIDC discovery -- essentially what Phase 3e proposes for standalone. For the initial release: document as unsupported on HCP; consider a validation webhook to reject the field. Future HCP support would require a HyperShift-side change to read the field -- the transport plumbing already exists.
+**OAuth API Server (External OIDC mode):** The OAuth API Server's outbound calls (JWKS/discovery fetches) only exist in External OIDC mode, which is itself still feature-gated behind the `external-oidc` subcommand. Proxy support for this code path is out of scope and can be added when External OIDC graduates.
+
+**HyperShift (Hosted Control Planes) -- not supported initially.** The CAO does not run in HyperShift (explicitly excluded from CVO payload). Auth pods run in the management cluster's HCP namespace. HyperShift already has proxy support via `HostedCluster.spec.configuration.proxy` and konnectivity sidecar injection (`InjectKonnectivityContainer()` with dual SOCKS5/HTTP CONNECT mode). HyperShift's `idp_convert.go:683-754` already builds proxy-aware HTTP transports for OIDC discovery -- essentially what Phase 2d proposes for standalone. For the initial release: document as unsupported on HCP; consider a validation webhook to reject the field. Future HCP support would require a HyperShift-side change to read the field -- the transport plumbing already exists.
 
 ## Risks and Mitigations
 
@@ -452,9 +377,7 @@ Informed by code analysis and by precedent from existing enhancement proposals: 
 | Risk | Mitigation |
 |------|------------|
 | API change requires openshift/api PR and review cycle | Start with API PR early; operator changes proceed in parallel using vendored types |
-| Env var injection alone does not reach the oauth-apiserver OIDC transport | Pass a proxy-configured `*http.Client` via `oidc.Options.Client` (Phase 2B). `Client` and `CAContentProvider` are mutually exclusive -- CA must be in `TLSClientConfig` |
 | CA bundle conflicts between component and cluster trust | Component `trustedCA` is appended to system trust (PEM concatenation), not replacing it |
-| OAuth API Server proxy injection could change behavior for existing clusters | No env vars set when no proxy is configured (no behavior change). Bug fix (Phase 2) is un-gated; component proxy (Phase 3d) is feature-gated |
 | `Authentication.spec.proxy` silently ignored on HyperShift | Document as unsupported; consider validation webhook |
 
 ### Operational risks
@@ -472,7 +395,7 @@ Informed by code analysis and by precedent from existing enhancement proposals: 
 
 | Risk | Mitigation |
 |------|------------|
-| **Feature gate proliferation** -- adds to ExternalOIDC test matrix | Gate is orthogonal to External OIDC. Test the cross-product |
+| **Feature gate proliferation** -- adds to test matrix | Gate is orthogonal to External OIDC |
 | **Z-stream rollback strips `spec.proxy`** -- CRD pruning during TechPreview | Set `Upgradeable=False`. Document cluster-wide proxy fallback before rollback. Risk disappears at GA |
 | **Limited TechPreview CI** | Dedicated periodic job. Graduation bar: 5+ tests, 7+/week, 95%+ pass rate, 14+ days |
 | **Proxy credential leakage** | Same model as cluster-wide proxy (credentials in URL). Future: optional `proxyCredentials` SecretNameReference |
