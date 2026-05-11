@@ -10,7 +10,8 @@ import (
 	"github.com/openshift/library-go/pkg/operator/configobserver"
 	"github.com/openshift/library-go/pkg/operator/events"
 
-	"github.com/openshift/cluster-authentication-operator/pkg/controllers/configobservation"
+	"github.com/openshift/cluster-authentication-operator/pkg/controllers/common"
+	localconfigobservation "github.com/openshift/cluster-authentication-operator/pkg/controllers/configobservation"
 	"github.com/openshift/cluster-authentication-operator/pkg/operator/datasync"
 )
 
@@ -22,7 +23,7 @@ func ObserveIdentityProviders(genericlisters configobserver.Listers, recorder ev
 		ret = configobserver.Pruned(ret, identityProvidersPath, identityProvidersMounts)
 	}()
 
-	listers := genericlisters.(configobservation.Listers)
+	listers := genericlisters.(localconfigobservation.Listers)
 	resourceSyncer := genericlisters.ResourceSyncer()
 	errs = []error{}
 
@@ -50,9 +51,25 @@ func ObserveIdentityProviders(genericlisters configobserver.Listers, recorder ev
 		return existingConfig, append(errs, err)
 	}
 
+	// resolve component-scoped proxy if feature gate is enabled
+	var httpProxy, httpsProxy, noProxy string
+	var proxyCAData []byte
+	authProxy, proxyErr := common.GetComponentProxyConfig(listers.FeatureGateAccessor, listers.OperatorAuthLister)
+	if proxyErr != nil {
+		klog.Warningf("failed to get component proxy config, falling back to cluster-wide proxy: %v", proxyErr)
+	}
+	if authProxy != nil {
+		httpProxy, httpsProxy, noProxy = common.ResolveProxyConfig(authProxy, nil)
+		if len(authProxy.TrustedCA.Name) > 0 && listers.OperatorNamespaceConfigMaps != nil {
+			if caCM, caErr := listers.OperatorNamespaceConfigMaps.ConfigMaps("openshift-authentication-operator").Get("auth-proxy-ca"); caErr == nil {
+				proxyCAData = []byte(caCM.Data["ca-bundle.crt"])
+			}
+		}
+	}
+
 	// convert identity providers from config to oauth-configuration API and
 	// extract the CMs and Secrets that need to be synchronized to the target NS
-	convertedObservedIdentityProviders, observedSyncData, idpErrs := convertIdentityProviders(listers.ConfigMapLister, listers.SecretsLister, oauthConfig.Spec.IdentityProviders)
+	convertedObservedIdentityProviders, observedSyncData, idpErrs := convertIdentityProviders(listers.ConfigMapLister, listers.SecretsLister, oauthConfig.Spec.IdentityProviders, httpProxy, httpsProxy, noProxy, proxyCAData)
 	if len(idpErrs) > 0 {
 		return existingConfig, append(errs, idpErrs...)
 	}

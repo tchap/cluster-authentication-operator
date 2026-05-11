@@ -210,7 +210,7 @@ func Test_convertProviderConfigToIDPData(t *testing.T) {
 				tt.providerConfig.OpenID.Issuer = server.URL
 			}
 
-			got, err := convertProviderConfigToIDPData(cmLister, secretLister, tt.providerConfig, syncData, 0)
+			got, err := convertProviderConfigToIDPData(cmLister, secretLister, tt.providerConfig, syncData, 0, "", "", "", nil)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("convertProviderConfigToIDPData() error = %v, wantErr %v", err, tt.wantErr)
 				return
@@ -314,6 +314,7 @@ func TestCheckOIDCPasswordGrantFlowCaching(t *testing.T) {
 			"test-client",
 			configv1.ConfigMapNameReference{Name: ""},
 			configv1.SecretNameReference{Name: "test-secret"},
+			"", "", "", nil,
 		)
 
 		require.NoError(t, err)
@@ -331,6 +332,7 @@ func TestCheckOIDCPasswordGrantFlowCaching(t *testing.T) {
 			"test-client",
 			configv1.ConfigMapNameReference{Name: ""},
 			configv1.SecretNameReference{Name: "test-secret"},
+			"", "", "", nil,
 		)
 
 		require.NoError(t, err)
@@ -350,6 +352,7 @@ func TestCheckOIDCPasswordGrantFlowCaching(t *testing.T) {
 			"test-client",
 			configv1.ConfigMapNameReference{Name: ""},
 			configv1.SecretNameReference{Name: "test-secret"},
+			"", "", "", nil,
 		)
 		require.NoError(t, err)
 		require.False(t, res1)
@@ -365,6 +368,7 @@ func TestCheckOIDCPasswordGrantFlowCaching(t *testing.T) {
 			"test-client",
 			configv1.ConfigMapNameReference{Name: ""},
 			configv1.SecretNameReference{Name: "test-secret"},
+			"", "", "", nil,
 		)
 		require.NoError(t, err)
 		require.True(t, res2)

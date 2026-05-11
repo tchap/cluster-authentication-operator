@@ -16,13 +16,18 @@ import (
 	coreinformers "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/kubernetes"
 	appsv1client "k8s.io/client-go/kubernetes/typed/apps/v1"
+	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 	appsv1listers "k8s.io/client-go/listers/apps/v1"
 	corev1listers "k8s.io/client-go/listers/core/v1"
 	"k8s.io/klog/v2"
+	"k8s.io/utils/ptr"
 
 	configv1 "github.com/openshift/api/config/v1"
+	operatorv1 "github.com/openshift/api/operator/v1"
+	applyoperatorv1 "github.com/openshift/client-go/operator/applyconfigurations/operator/v1"
 	configinformer "github.com/openshift/client-go/config/informers/externalversions"
 	configv1listers "github.com/openshift/client-go/config/listers/config/v1"
+	operatorv1listers "github.com/openshift/client-go/operator/listers/operator/v1"
 	routeinformers "github.com/openshift/client-go/route/informers/externalversions"
 	routev1listers "github.com/openshift/client-go/route/listers/route/v1"
 	"github.com/openshift/cluster-authentication-operator/bindata"
@@ -30,6 +35,7 @@ import (
 	bootstrap "github.com/openshift/library-go/pkg/authentication/bootstrapauthenticator"
 	"github.com/openshift/library-go/pkg/controller/factory"
 	"github.com/openshift/library-go/pkg/operator/apiserver/controller/workload"
+	"github.com/openshift/library-go/pkg/operator/configobserver/featuregates"
 	"github.com/openshift/library-go/pkg/operator/events"
 	"github.com/openshift/library-go/pkg/operator/resource/resourceapply"
 	"github.com/openshift/library-go/pkg/operator/resource/resourcemerge"
@@ -60,11 +66,16 @@ type oauthServerDeploymentSyncer struct {
 	deployments       appsv1client.DeploymentsGetter
 	deploymentsLister appsv1listers.DeploymentLister
 
+	configMaps     corev1client.ConfigMapsGetter
 	configMapLister corev1listers.ConfigMapLister
+	sourceConfigMapLister corev1listers.ConfigMapLister // openshift-config namespace
 	secretLister    corev1listers.SecretLister
 	podsLister      corev1listers.PodLister
 	proxyLister     configv1listers.ProxyLister
 	routeLister     routev1listers.RouteLister
+
+	operatorAuthLister  operatorv1listers.AuthenticationLister
+	featureGateAccessor featuregates.FeatureGateAccess
 
 	authConfigChecker          common.AuthConfigChecker
 	bootstrapUserDataGetter    bootstrap.BootstrapUserDataGetter
@@ -83,7 +94,11 @@ func NewOAuthServerWorkloadController(
 	eventsRecorder events.Recorder,
 	versionRecorder status.VersionGetter,
 	kubeInformersForTargetNamespace informers.SharedInformerFactory,
+	kubeInformersForSourceNamespace informers.SharedInformerFactory,
 	authConfigChecker common.AuthConfigChecker,
+	operatorAuthLister operatorv1listers.AuthenticationLister,
+	featureGateAccessor featuregates.FeatureGateAccess,
+	operatorAuthInformer factory.Informer,
 ) factory.Controller {
 	targetNS := "openshift-authentication"
 
@@ -96,11 +111,16 @@ func NewOAuthServerWorkloadController(
 		deployments:       kubeClient.AppsV1(),
 		deploymentsLister: kubeInformersForTargetNamespace.Apps().V1().Deployments().Lister(),
 
-		configMapLister: kubeInformersForTargetNamespace.Core().V1().ConfigMaps().Lister(),
-		secretLister:    kubeInformersForTargetNamespace.Core().V1().Secrets().Lister(),
-		podsLister:      kubeInformersForTargetNamespace.Core().V1().Pods().Lister(),
-		proxyLister:     configInformers.Config().V1().Proxies().Lister(),
-		routeLister:     routeInformersForTargetNamespace.Route().V1().Routes().Lister(),
+		configMaps:            kubeClient.CoreV1(),
+		configMapLister:       kubeInformersForTargetNamespace.Core().V1().ConfigMaps().Lister(),
+		sourceConfigMapLister: kubeInformersForSourceNamespace.Core().V1().ConfigMaps().Lister(),
+		secretLister:          kubeInformersForTargetNamespace.Core().V1().Secrets().Lister(),
+		podsLister:            kubeInformersForTargetNamespace.Core().V1().Pods().Lister(),
+		proxyLister:           configInformers.Config().V1().Proxies().Lister(),
+		routeLister:           routeInformersForTargetNamespace.Route().V1().Routes().Lister(),
+
+		operatorAuthLister:  operatorAuthLister,
+		featureGateAccessor: featureGateAccessor,
 
 		authConfigChecker:       authConfigChecker,
 		bootstrapUserDataGetter: bootstrapUserDataGetter,
@@ -117,6 +137,7 @@ func NewOAuthServerWorkloadController(
 		configInformers.Config().V1().Ingresses().Informer(),
 		configInformers.Config().V1().Proxies().Informer(),
 		nodeInformer.Informer(),
+		operatorAuthInformer,
 	}
 	clusterScopedInformers = append(clusterScopedInformers, common.AuthConfigCheckerInformers[factory.Informer](&authConfigChecker)...)
 
@@ -138,6 +159,7 @@ func NewOAuthServerWorkloadController(
 			kubeInformersForTargetNamespace.Core().V1().Pods().Informer(),
 			kubeInformersForTargetNamespace.Core().V1().Namespaces().Informer(),
 			routeInformersForTargetNamespace.Route().V1().Routes().Informer(),
+			kubeInformersForSourceNamespace.Core().V1().ConfigMaps().Informer(),
 		},
 		oauthDeploymentSyncer,
 		eventsRecorder,
@@ -196,9 +218,20 @@ func (c *oauthServerDeploymentSyncer) Sync(ctx context.Context, syncContext fact
 		return nil, false, append(errs, err)
 	}
 
-	proxyConfig, err := c.getProxyConfig()
+	authProxy, err := common.GetComponentProxyConfig(c.featureGateAccessor, c.operatorAuthLister)
+	if err != nil {
+		klog.Warningf("failed to get component proxy config, falling back to cluster-wide proxy: %v", err)
+	}
+
+	clusterProxy, err := c.getProxyConfig()
 	if err != nil {
 		return nil, false, append(errs, err)
+	}
+
+	httpProxy, httpsProxy, noProxy := common.ResolveProxyConfig(authProxy, clusterProxy)
+
+	if err := c.setComponentProxyUpgradeableCondition(ctx, authProxy); err != nil {
+		errs = append(errs, fmt.Errorf("setting upgradeable condition: %v", err))
 	}
 
 	// resourceVersions serves to store versions of config resources so that we
@@ -209,9 +242,8 @@ func (c *oauthServerDeploymentSyncer) Sync(ctx context.Context, syncContext fact
 	// TODO move this hash from deployment meta to operatorConfig.status.generations.[...].hash
 	resourceVersions := []string{}
 
-	if len(proxyConfig.Name) > 0 {
-		resourceVersions = append(resourceVersions, "proxy:"+proxyConfig.Name+":"+proxyConfig.ResourceVersion)
-	}
+	resourceVersions = append(resourceVersions,
+		fmt.Sprintf("proxy:%s:%s:%s", httpProxy, httpsProxy, noProxy))
 
 	configResourceVersions, err := c.getConfigResourceVersions()
 	if err != nil {
@@ -231,7 +263,7 @@ func (c *oauthServerDeploymentSyncer) Sync(ctx context.Context, syncContext fact
 	}
 
 	// deployment, have RV of all resources
-	expectedDeployment, err := getOAuthServerDeployment(operatorSpec, proxyConfig, c.bootstrapUserChangeRollOut, resourceVersions...)
+	expectedDeployment, err := getOAuthServerDeployment(operatorSpec, httpProxy, httpsProxy, noProxy, c.bootstrapUserChangeRollOut, resourceVersions...)
 	if err != nil {
 		return nil, false, append(errs, err)
 	}
@@ -250,6 +282,10 @@ func (c *oauthServerDeploymentSyncer) Sync(ctx context.Context, syncContext fact
 			ReadOnly:  true,
 			MountPath: "/var/config/system/secrets/v4-0-config-system-custom-router-certs",
 		})
+	}
+
+	if err := c.syncComponentProxyCA(ctx, syncContext, authProxy, expectedDeployment); err != nil {
+		return nil, false, append(errs, fmt.Errorf("syncing component proxy CA: %v", err))
 	}
 
 	err = c.ensureAtMostOnePodPerNode(&expectedDeployment.Spec, "oauth-openshift")
@@ -330,4 +366,113 @@ func setRollingUpdateParameters(controlPlaneCount int32, deployment *appsv1.Depl
 	maxSurge := intstr.FromInt32(controlPlaneCount)
 	deployment.Spec.Strategy.RollingUpdate.MaxUnavailable = &maxUnavailable
 	deployment.Spec.Strategy.RollingUpdate.MaxSurge = &maxSurge
+}
+
+const (
+	componentProxyUpgradeableCondition = "AuthenticationComponentProxyUpgradeable"
+	componentProxyCAConfigMapName      = "v4-0-config-system-auth-proxy-ca"
+	componentProxyCAMountPath     = "/var/config/system/configmaps/" + componentProxyCAConfigMapName
+)
+
+func (c *oauthServerDeploymentSyncer) setComponentProxyUpgradeableCondition(
+	ctx context.Context,
+	authProxy *operatorv1.AuthenticationProxyConfig,
+) error {
+	if authProxy == nil {
+		return nil
+	}
+
+	cond := applyoperatorv1.OperatorCondition().
+		WithType(componentProxyUpgradeableCondition).
+		WithStatus(operatorv1.ConditionFalse).
+		WithReason("ComponentProxyConfigured").
+		WithMessage("component-scoped proxy is configured; upgrades are blocked while this TechPreview feature is in use")
+
+	return c.operatorClient.ApplyOperatorStatus(
+		ctx,
+		"OAuthServerDeployment",
+		applyoperatorv1.OperatorStatus().WithConditions(cond),
+	)
+}
+
+// syncComponentProxyCA copies the component-scoped proxy CA ConfigMap from
+// openshift-config to openshift-authentication and adds volume/mount + entrypoint
+// append to the OAuth Server deployment so the CA is included in system trust.
+func (c *oauthServerDeploymentSyncer) syncComponentProxyCA(
+	ctx context.Context,
+	syncContext factory.SyncContext,
+	authProxy *operatorv1.AuthenticationProxyConfig,
+	deployment *appsv1.Deployment,
+) error {
+	if authProxy == nil || len(authProxy.TrustedCA.Name) == 0 {
+		return nil
+	}
+
+	sourceCM, err := c.sourceConfigMapLister.ConfigMaps("openshift-config").Get(authProxy.TrustedCA.Name)
+	if err != nil {
+		return fmt.Errorf("getting component proxy CA configmap %s/%s: %v", "openshift-config", authProxy.TrustedCA.Name, err)
+	}
+
+	targetCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "openshift-authentication",
+			Name:      componentProxyCAConfigMapName,
+		},
+		Data: sourceCM.Data,
+	}
+	_, _, err = resourceapply.ApplyConfigMap(ctx, c.configMaps, syncContext.Recorder(), targetCM)
+	if err != nil {
+		return fmt.Errorf("applying component proxy CA configmap to openshift-authentication: %v", err)
+	}
+
+	operatorTargetCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "openshift-authentication-operator",
+			Name:      "auth-proxy-ca",
+		},
+		Data: sourceCM.Data,
+	}
+	_, _, err = resourceapply.ApplyConfigMap(ctx, c.configMaps, syncContext.Recorder(), operatorTargetCM)
+	if err != nil {
+		return fmt.Errorf("applying component proxy CA configmap to openshift-authentication-operator: %v", err)
+	}
+
+	deployment.Spec.Template.Spec.Volumes = append(deployment.Spec.Template.Spec.Volumes, corev1.Volume{
+		Name: componentProxyCAConfigMapName,
+		VolumeSource: corev1.VolumeSource{
+			ConfigMap: &corev1.ConfigMapVolumeSource{
+				LocalObjectReference: corev1.LocalObjectReference{
+					Name: componentProxyCAConfigMapName,
+				},
+				Optional: ptr.To(true),
+			},
+		},
+	})
+	deployment.Spec.Template.Spec.Containers[0].VolumeMounts = append(
+		deployment.Spec.Template.Spec.Containers[0].VolumeMounts,
+		corev1.VolumeMount{
+			Name:      componentProxyCAConfigMapName,
+			ReadOnly:  true,
+			MountPath: componentProxyCAMountPath,
+		},
+	)
+
+	// Inject entrypoint append to add component proxy CA to system trust.
+	// The existing entrypoint copies system trust then runs the server;
+	// insert the append block before the exec line.
+	appendBlock := fmt.Sprintf(
+		"\nif [ -s %s/ca-bundle.crt ]; then\n"+
+			"    echo \"Appending component proxy CA bundle\"\n"+
+			"    cat %s/ca-bundle.crt >> /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem\n"+
+			"fi\n",
+		componentProxyCAMountPath, componentProxyCAMountPath,
+	)
+	deployment.Spec.Template.Spec.Containers[0].Args[0] = strings.Replace(
+		deployment.Spec.Template.Spec.Containers[0].Args[0],
+		"exec oauth-server",
+		appendBlock+"exec oauth-server",
+		1,
+	)
+
+	return nil
 }

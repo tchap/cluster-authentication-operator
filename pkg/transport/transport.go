@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 
-	"k8s.io/apimachinery/pkg/util/net"
+	"golang.org/x/net/http/httpproxy"
+	knet "k8s.io/apimachinery/pkg/util/net"
 	corelistersv1 "k8s.io/client-go/listers/core/v1"
 	ktransport "k8s.io/client-go/transport"
 )
@@ -42,6 +44,60 @@ func TransportForCARef(cmLister corelistersv1.ConfigMapLister, caConfigMapName, 
 	return TransportFor("", caData, nil, nil)
 }
 
+// TransportForCARefWithProxy creates an http.RoundTripper with explicit proxy
+// settings and optional extra CA data for the proxy's TLS certificate.
+// When all proxy strings are empty, the transport uses no proxy at all
+// (overriding http.ProxyFromEnvironment). When extraCAData is non-empty,
+// it is appended to the CA cert pool used for TLS verification.
+func TransportForCARefWithProxy(
+	cmLister corelistersv1.ConfigMapLister,
+	caConfigMapName, key string,
+	httpProxy, httpsProxy, noProxy string,
+	extraCAData []byte,
+) (http.RoundTripper, error) {
+	var caData []byte
+	if len(caConfigMapName) > 0 {
+		cm, err := cmLister.ConfigMaps("openshift-config").Get(caConfigMapName)
+		if err != nil {
+			return nil, err
+		}
+		caData = []byte(cm.Data[key])
+		if len(caData) == 0 {
+			caData = cm.BinaryData[key]
+		}
+		if len(caData) == 0 {
+			return nil, fmt.Errorf("config map %s/%s has no ca data at key %s", "openshift-config", caConfigMapName, key)
+		}
+	}
+
+	if len(extraCAData) > 0 {
+		caData = append(append([]byte{}, caData...), extraCAData...)
+	}
+
+	rt, err := transportForInner("", caData, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	if t, ok := rt.(*http.Transport); ok {
+		if len(httpProxy) > 0 || len(httpsProxy) > 0 {
+			proxyCfg := httpproxy.Config{
+				HTTPProxy:  httpProxy,
+				HTTPSProxy: httpsProxy,
+				NoProxy:    noProxy,
+			}
+			proxyFunc := proxyCfg.ProxyFunc()
+			t.Proxy = func(req *http.Request) (*url.URL, error) {
+				return proxyFunc(req.URL)
+			}
+		} else {
+			t.Proxy = nil
+		}
+	}
+
+	return ktransport.DebugWrappers(rt), nil
+}
+
 func transportForInner(serverName string, caData, certData, keyData []byte) (http.RoundTripper, error) {
 	if len(caData) == 0 && len(certData) == 0 && len(keyData) == 0 {
 		return http.DefaultTransport, nil
@@ -52,7 +108,7 @@ func transportForInner(serverName string, caData, certData, keyData []byte) (htt
 	}
 
 	// copy default transport
-	transport := net.SetTransportDefaults(&http.Transport{
+	transport := knet.SetTransportDefaults(&http.Transport{
 		TLSClientConfig: &tls.Config{
 			ServerName: serverName,
 		},

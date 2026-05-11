@@ -57,13 +57,15 @@ func convertIdentityProviders(
 	cmLister corelistersv1.ConfigMapLister,
 	secretsLister corelistersv1.SecretLister,
 	identityProviders []configv1.IdentityProvider,
+	httpProxy, httpsProxy, noProxy string,
+	proxyCAData []byte,
 ) ([]interface{}, *datasync.ConfigSyncData, []error) {
 	converted := []osinv1.IdentityProvider{}
 	syncData := datasync.NewConfigSyncData()
 	errs := []error{}
 
 	for i, idp := range defaultIDPMappingMethods(identityProviders) {
-		data, err := convertProviderConfigToIDPData(cmLister, secretsLister, &idp.IdentityProviderConfig, syncData, i)
+		data, err := convertProviderConfigToIDPData(cmLister, secretsLister, &idp.IdentityProviderConfig, syncData, i, httpProxy, httpsProxy, noProxy, proxyCAData)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("failed to apply IDP %s config: %v", idp.Name, err))
 			continue
@@ -116,6 +118,8 @@ func convertProviderConfigToIDPData(
 	providerConfig *configv1.IdentityProviderConfig,
 	syncData *datasync.ConfigSyncData,
 	i int,
+	httpProxy, httpsProxy, noProxy string,
+	proxyCAData []byte,
 ) (*idpData, error) {
 	const missingProviderFmt string = "type %s was specified, but its configuration is missing"
 
@@ -241,7 +245,7 @@ func convertProviderConfigToIDPData(
 			return nil, fmt.Errorf(missingProviderFmt, providerConfig.Type)
 		}
 
-		urls, err := discoverOpenIDURLs(cmLister, openIDConfig.Issuer, corev1.ServiceAccountRootCAKey, openIDConfig.CA)
+		urls, err := discoverOpenIDURLs(cmLister, openIDConfig.Issuer, corev1.ServiceAccountRootCAKey, openIDConfig.CA, httpProxy, httpsProxy, noProxy, proxyCAData)
 		if err != nil {
 			return nil, err
 		}
@@ -278,6 +282,8 @@ func convertProviderConfigToIDPData(
 			openIDConfig.ClientID,
 			openIDConfig.CA,
 			openIDConfig.ClientSecret,
+			httpProxy, httpsProxy, noProxy,
+			proxyCAData,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("error attempting password grant flow: %v", err)
@@ -312,7 +318,7 @@ func convertProviderConfigToIDPData(
 
 // discoverOpenIDURLs retrieves basic information about an OIDC server with hostname
 // given by the `issuer` argument
-func discoverOpenIDURLs(cmLister corelistersv1.ConfigMapLister, issuer, key string, ca configv1.ConfigMapNameReference) (*osinv1.OpenIDURLs, error) {
+func discoverOpenIDURLs(cmLister corelistersv1.ConfigMapLister, issuer, key string, ca configv1.ConfigMapNameReference, httpProxy, httpsProxy, noProxy string, proxyCAData []byte) (*osinv1.OpenIDURLs, error) {
 	issuer = strings.TrimRight(issuer, "/") // TODO make impossible via validation and remove
 
 	wellKnown := issuer + "/.well-known/openid-configuration"
@@ -321,7 +327,12 @@ func discoverOpenIDURLs(cmLister corelistersv1.ConfigMapLister, issuer, key stri
 		return nil, err
 	}
 
-	rt, err := transport.TransportForCARef(cmLister, ca.Name, key)
+	var rt http.RoundTripper
+	if len(httpProxy) > 0 || len(httpsProxy) > 0 || len(proxyCAData) > 0 {
+		rt, err = transport.TransportForCARefWithProxy(cmLister, ca.Name, key, httpProxy, httpsProxy, noProxy, proxyCAData)
+	} else {
+		rt, err = transport.TransportForCARef(cmLister, ca.Name, key)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -376,6 +387,8 @@ func checkOIDCPasswordGrantFlow(
 	tokenURL, clientID string,
 	caRererence configv1.ConfigMapNameReference,
 	clientSecretReference configv1.SecretNameReference,
+	httpProxy, httpsProxy, noProxy string,
+	proxyCAData []byte,
 ) (bool, error) {
 	secret, err := secretsLister.Secrets("openshift-config").Get(clientSecretReference.Name)
 	if err != nil {
@@ -394,7 +407,12 @@ func checkOIDCPasswordGrantFlow(
 		return false, fmt.Errorf("the referenced secret does not contain a value for the 'clientSecret' key")
 	}
 
-	transport, err := transport.TransportForCARef(cmLister, caRererence.Name, corev1.ServiceAccountRootCAKey)
+	var rt http.RoundTripper
+	if len(httpProxy) > 0 || len(httpsProxy) > 0 || len(proxyCAData) > 0 {
+		rt, err = transport.TransportForCARefWithProxy(cmLister, caRererence.Name, corev1.ServiceAccountRootCAKey, httpProxy, httpsProxy, noProxy, proxyCAData)
+	} else {
+		rt, err = transport.TransportForCARef(cmLister, caRererence.Name, corev1.ServiceAccountRootCAKey)
+	}
 	if err != nil {
 		return false, fmt.Errorf("couldn't get a transport for the referenced CA: %v", err)
 	}
@@ -417,7 +435,7 @@ func checkOIDCPasswordGrantFlow(
 	// explicitly set Accept to 'application/json' as that's the expected deserializable output
 	req.Header.Set("Accept", "application/json")
 
-	client := &http.Client{Transport: transport}
+	client := &http.Client{Transport: rt}
 	resp, err := client.Do(req)
 	if err != nil {
 		return false, err

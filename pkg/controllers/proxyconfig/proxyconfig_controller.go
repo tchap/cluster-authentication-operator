@@ -15,10 +15,14 @@ import (
 	corev1lister "k8s.io/client-go/listers/core/v1"
 	"k8s.io/klog/v2"
 
+	operatorv1 "github.com/openshift/api/operator/v1"
+	configv1listers "github.com/openshift/client-go/config/listers/config/v1"
+	operatorv1listers "github.com/openshift/client-go/operator/listers/operator/v1"
 	routeinformer "github.com/openshift/client-go/route/informers/externalversions/route/v1"
 	v1 "github.com/openshift/client-go/route/listers/route/v1"
 	"github.com/openshift/cluster-authentication-operator/pkg/controllers/common"
 	"github.com/openshift/library-go/pkg/controller/factory"
+	"github.com/openshift/library-go/pkg/operator/configobserver/featuregates"
 	"github.com/openshift/library-go/pkg/operator/events"
 	"github.com/openshift/library-go/pkg/operator/v1helpers"
 	"github.com/openshift/library-go/pkg/route/routeapihelpers"
@@ -32,6 +36,10 @@ type proxyConfigChecker struct {
 	routeNamespace  string
 	caConfigMaps    map[string][]string // ns -> []configmapNames
 
+	operatorAuthLister  operatorv1listers.AuthenticationLister
+	featureGateAccessor featuregates.FeatureGateAccess
+	clusterProxyLister  configv1listers.ProxyLister
+
 	authConfigChecker common.AuthConfigChecker
 }
 
@@ -43,14 +51,22 @@ func NewProxyConfigChecker(
 	routeName string,
 	caConfigMaps map[string][]string,
 	recorder events.Recorder,
-	operatorClient v1helpers.OperatorClient) factory.Controller {
+	operatorClient v1helpers.OperatorClient,
+	operatorAuthLister operatorv1listers.AuthenticationLister,
+	featureGateAccessor featuregates.FeatureGateAccess,
+	clusterProxyLister configv1listers.ProxyLister,
+	operatorAuthInformer factory.Informer,
+) factory.Controller {
 	p := proxyConfigChecker{
-		routeLister:       routeInformer.Lister(),
-		configMapLister:   configMapInformers.ConfigMapLister(),
-		routeName:         routeName,
-		routeNamespace:    routeNamespace,
-		caConfigMaps:      caConfigMaps,
-		authConfigChecker: authConfigChecker,
+		routeLister:         routeInformer.Lister(),
+		configMapLister:     configMapInformers.ConfigMapLister(),
+		routeName:           routeName,
+		routeNamespace:      routeNamespace,
+		caConfigMaps:        caConfigMaps,
+		operatorAuthLister:  operatorAuthLister,
+		featureGateAccessor: featureGateAccessor,
+		clusterProxyLister:  clusterProxyLister,
+		authConfigChecker:   authConfigChecker,
 	}
 
 	c := factory.New().
@@ -58,8 +74,13 @@ func NewProxyConfigChecker(
 		WithInformers(
 			routeInformer.Informer(),
 		).
-		WithInformers(common.AuthConfigCheckerInformers[factory.Informer](&authConfigChecker)...).
-		ResyncEvery(60 * time.Minute).
+		WithInformers(common.AuthConfigCheckerInformers[factory.Informer](&authConfigChecker)...)
+
+	if operatorAuthInformer != nil {
+		c = c.WithInformers(operatorAuthInformer)
+	}
+
+	c = c.ResyncEvery(60 * time.Minute).
 		WithSyncDegradedOnError(operatorClient)
 
 	for ns, configMapNames := range caConfigMaps {
@@ -80,9 +101,17 @@ func (p *proxyConfigChecker) sync(ctx context.Context, _ factory.SyncContext) er
 		return nil
 	}
 
+	// Check for component-scoped proxy first
+	authProxy, proxyErr := common.GetComponentProxyConfig(p.featureGateAccessor, p.operatorAuthLister)
+	if proxyErr != nil {
+		klog.Warningf("failed to get component proxy config, falling back to cluster-wide proxy: %v", proxyErr)
+	}
+	if authProxy != nil {
+		return p.validateComponentProxy(ctx, authProxy)
+	}
+
 	proxyConfig := httpproxy.FromEnvironment()
 	if !isProxyConfigured(proxyConfig) {
-		// If proxy is not configured, then it is a no-op.
 		return nil
 	}
 
@@ -103,6 +132,62 @@ func (p *proxyConfigChecker) sync(ctx context.Context, _ factory.SyncContext) er
 	}
 
 	return checkProxyConfig(ctx, routeURL, proxyConfig.NoProxy, clientWithProxy, clientWithoutProxy)
+}
+
+func (p *proxyConfigChecker) validateComponentProxy(ctx context.Context, authProxy *operatorv1.AuthenticationProxyConfig) error {
+	httpProxy, httpsProxy, noProxy := common.ResolveProxyConfig(authProxy, nil)
+	if len(httpProxy) == 0 && len(httpsProxy) == 0 {
+		klog.V(4).Info("Component proxy configured with empty values, skipping validation")
+		return nil
+	}
+
+	route, err := p.routeLister.Routes(p.routeNamespace).Get(p.routeName)
+	if err != nil {
+		return err
+	}
+
+	routeURL, _, err := routeapihelpers.IngressURI(route, "")
+	if err != nil {
+		return err
+	}
+	routeURL.Path = "healthz"
+
+	caPool, err := p.getCACerts()
+	if err != nil {
+		return err
+	}
+
+	// Load component proxy CA if configured
+	if len(authProxy.TrustedCA.Name) > 0 {
+		if caCM, caErr := p.configMapLister.ConfigMaps("openshift-authentication-operator").Get("auth-proxy-ca"); caErr == nil {
+			caPool.AppendCertsFromPEM([]byte(caCM.Data["ca-bundle.crt"]))
+		}
+	}
+
+	tlsConfig := &tls.Config{RootCAs: caPool}
+
+	componentProxyCfg := httpproxy.Config{
+		HTTPProxy:  httpProxy,
+		HTTPSProxy: httpsProxy,
+		NoProxy:    noProxy,
+	}
+	proxyFn := componentProxyCfg.ProxyFunc()
+
+	clientWithProxy := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: tlsConfig,
+			Proxy: func(req *http.Request) (*url.URL, error) {
+				return proxyFn(req.URL)
+			},
+		},
+	}
+	clientWithoutProxy := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: tlsConfig,
+		},
+	}
+
+	return checkProxyConfig(ctx, routeURL, noProxy, clientWithProxy, clientWithoutProxy)
 }
 
 // checkProxyConfig determines any mis-configuration in proxy settings by attempting

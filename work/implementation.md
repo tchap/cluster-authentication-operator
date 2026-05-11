@@ -31,7 +31,18 @@ func ResolveProxyConfig(
 }
 ```
 
-Pure function, no feature gate logic -- callers decide whether to pass `authProxy` based on the gate. Unit tests in `proxy_test.go` covering all 4 resolution states.
+Pure function, no feature gate logic -- callers decide whether to pass `authProxy` based on the gate. Unit tests in `proxy_test.go` covering all 4 resolution states plus partial-values case.
+
+Helper to get the proxy object with feature gate guarding:
+
+```go
+func GetComponentProxyConfig(
+    featureGateAccessor featuregates.FeatureGateAccess,
+    operatorAuthLister operatorv1listers.AuthenticationLister,
+) (*operatorv1.AuthenticationProxyConfig, error)
+```
+
+Returns `(nil, nil)` when the gate is disabled, not yet observed, or the resource is not found. Returns a non-nil error only when the lister fails unexpectedly -- callers log the error and fall back to cluster-wide proxy.
 
 ---
 
@@ -46,33 +57,34 @@ Pure function, no feature gate logic -- callers decide whether to pass `authProx
 
 Add fields to `oauthServerDeploymentSyncer`:
 ```go
+configMaps          corev1client.ConfigMapsGetter     // for CA ConfigMap apply
+sourceConfigMapLister corev1listers.ConfigMapLister   // openshift-config namespace
 operatorAuthLister  operatorv1listers.AuthenticationLister
 featureGateAccessor featuregates.FeatureGateAccess
 ```
 
 Add params to `NewOAuthServerWorkloadController()`:
 ```go
+kubeInformersForSourceNamespace informers.SharedInformerFactory,  // openshift-config
 operatorAuthLister operatorv1listers.AuthenticationLister,
 featureGateAccessor featuregates.FeatureGateAccess,
 operatorAuthInformer factory.Informer,
 ```
 
 Register `operatorAuthInformer` in the controller's `clusterScopedInformers`.
+Register `kubeInformersForSourceNamespace.Core().V1().ConfigMaps().Informer()` in the controller's namespaced informers -- this ensures changes to the source CA ConfigMap in `openshift-config` trigger a re-sync.
 
-In `Sync()`, resolve proxy:
+In `Sync()`, resolve proxy via helper:
 ```go
-// Existing: proxyConfig, err := c.getProxyConfig()
-// New: resolve component-scoped if feature gate enabled
-var authProxy *operatorv1.AuthenticationProxyConfig
-if featureGateEnabled {
-    authOp, err := c.operatorAuthLister.Get("cluster")
-    authProxy = authOp.Spec.Proxy
+authProxy, err := common.GetComponentProxyConfig(c.featureGateAccessor, c.operatorAuthLister)
+if err != nil {
+    klog.Warningf("failed to get component proxy config, falling back to cluster-wide proxy: %v", err)
 }
-clusterProxy, _ := c.getProxyConfig()
+clusterProxy, err := c.getProxyConfig()
 httpProxy, httpsProxy, noProxy := common.ResolveProxyConfig(authProxy, clusterProxy)
 ```
 
-Update resource version tracking to include resolved proxy values in the hash (instead of cluster proxy ResourceVersion).
+Update resource version tracking: replace `"proxy:"+proxyConfig.Name+":"+proxyConfig.ResourceVersion` with `fmt.Sprintf("proxy:%s:%s:%s", httpProxy, httpsProxy, noProxy)`. This tracks the resolved values instead of the cluster proxy object identity, so changes to either source trigger redeployment.
 
 ### default_deployment.go
 
@@ -86,46 +98,49 @@ func getOAuthServerDeployment(
 ) (*appsv1.Deployment, error)
 ```
 
-Replace `proxyConfigToEnvVars(proxyConfig)` with direct env var construction from the string params.
+Replace `proxyConfigToEnvVars(proxyConfig)` with `proxyEnvVars(httpProxy, httpsProxy, noProxy)` -- same logic, reads from string params instead of `proxy.Status.*`. Remove unused `configv1` import.
 
 ### starter.go
 
-Update deployment controller wiring (~line 272) to pass new deps:
+Update deployment controller wiring to pass new deps:
 ```go
+informerFactories.kubeInformersForNamespaces.InformersFor("openshift-config"),  // source namespace
 informerFactories.operatorInformer.Operator().V1().Authentications().Lister(),
 featureGateAccessor,
 informerFactories.operatorInformer.Operator().V1().Authentications().Informer(),
 ```
+
+**Implementation note:** The typed `operatorv1.Authentication` lister comes from `informerFactories.operatorInformer.Operator().V1().Authentications()`, which is distinct from `informerFactories.operatorConfigInformer.Config().V1().Authentications()` (the `configv1.Authentication` used by `AuthConfigChecker`).
 
 ---
 
 ## Step 3: Trusted CA syncing and mounting (2b, Option A)
 
 **Files:**
-- `pkg/controllers/deployment/deployment_controller.go` (CA ConfigMap copy)
-- `pkg/controllers/deployment/default_deployment.go` (entrypoint + volume/mount)
+- `pkg/controllers/deployment/deployment_controller.go` (CA ConfigMap copy + volume/mount + entrypoint)
 
-### ConfigMap copy in deployment controller
+### ConfigMap copy via direct apply (not resourceSyncController)
 
-In `Sync()`, when `authProxy.TrustedCA.Name` is set:
-1. Read source ConfigMap from `openshift-config` via kubeClient
-2. Apply a copy as `v4-0-config-system-auth-proxy-ca` in `openshift-authentication` using `resourceapply.ApplyConfigMap()`
-3. Apply a copy as `auth-proxy-ca` in `openshift-authentication-operator` (for the operator's own transport, Step 4)
+`resourceSyncController.SyncConfigMap()` registers a fixed source→destination mapping at startup. The source name comes from `spec.proxy.trustedCA.name` which is dynamic. `SyncConfigMapConditionally` has the same limitation. So we use direct `resourceapply.ApplyConfigMap()` in the deployment controller's `Sync()`.
 
-Add `configMaps corev1client.ConfigMapsGetter` field to `oauthServerDeploymentSyncer` (use `kubeClient.CoreV1()`). Also add a ConfigMap lister for `openshift-config` namespace.
+New method `syncComponentProxyCA()` called from `Sync()`:
+1. If `authProxy == nil` or `authProxy.TrustedCA.Name` is empty, return nil (no-op)
+2. Read source ConfigMap from `openshift-config` via `sourceConfigMapLister`
+3. Apply as `v4-0-config-system-auth-proxy-ca` in `openshift-authentication` (for the OAuth Server)
+4. Apply as `auth-proxy-ca` in `openshift-authentication-operator` (for the operator's own transport)
+5. Add volume + volume mount to the deployment
+6. Inject entrypoint append block via `strings.Replace` on the `"exec oauth-server"` marker
 
-### Volume + mount in deployment controller Sync()
+The ConfigMap in `openshift-authentication` uses the `v4-0-config-` prefix so `getConfigResourceVersions()` automatically picks it up for deployment hash tracking, triggering rollouts on CA changes.
 
-When CA is set, append volume and volume mount to expected deployment:
-```go
-Volume: v4-0-config-system-auth-proxy-ca -> ConfigMap v4-0-config-system-auth-proxy-ca (optional)
+Volume name and mount follow existing conventions:
+```
+Name:  v4-0-config-system-auth-proxy-ca
 Mount: /var/config/system/configmaps/v4-0-config-system-auth-proxy-ca
+ConfigMap is optional (ptr.To(true))
 ```
 
-### Entrypoint append in default_deployment.go
-
-Add a parameter `componentProxyCAConfigMapName string` to `getOAuthServerDeployment()`. When non-empty, inject an append block into `container.Args[0]` before the `exec` line:
-
+Entrypoint append inserted before the `exec` line:
 ```bash
 if [ -s /var/config/system/configmaps/v4-0-config-system-auth-proxy-ca/ca-bundle.crt ]; then
     echo "Appending component proxy CA bundle"
@@ -133,7 +148,7 @@ if [ -s /var/config/system/configmaps/v4-0-config-system-auth-proxy-ca/ca-bundle
 fi
 ```
 
-Insert via `strings.Replace` on the `exec oauth-server` marker in the args string.
+This runs after the existing system trust copy, so the result is: system trust + cluster-wide proxy CA + component proxy CA.
 
 ---
 
@@ -149,59 +164,72 @@ Insert via `strings.Replace` on the `exec oauth-server` marker in the args strin
 
 ### transport.go
 
-Add new function:
-```go
-func TransportForCARefWithProxy(
-    cmLister corelistersv1.ConfigMapLister,
-    caConfigMapName, key string,
-    httpProxy, httpsProxy, noProxy string,
-    extraCAData []byte,
-) (http.RoundTripper, error)
-```
+Renamed `net` import to `knet` (alias for `k8s.io/apimachinery/pkg/util/net`) to avoid conflict with new imports. Added `net/url`, `golang.org/x/net/http/httpproxy`.
 
-Implementation:
-- Build transport as in `TransportForCARef()` 
-- If any proxy value is non-empty, override transport.Proxy with a function built from `httpproxy.Config{HTTPProxy, HTTPSProxy, NoProxy}.ProxyFunc()`
-- If `extraCAData` is non-empty, append to the CA cert pool (for component proxy CA)
-- If all proxy values are empty AND the caller explicitly chose component proxy (not fallback), set `transport.Proxy = nil` to disable proxy entirely
+New function `TransportForCARefWithProxy()`:
+- Loads CA from ConfigMap (same as `TransportForCARef`)
+- If `extraCAData` is non-empty, appends to the CA cert pool
+- Builds transport via `transportForInner()` (returns `*http.Transport`, not wrapped)
+- If proxy values are non-empty, overrides `transport.Proxy` with function built from `httpproxy.Config.ProxyFunc()`
+- If all proxy values are empty, sets `transport.Proxy = nil` (explicit no-proxy)
+- Wraps with `ktransport.DebugWrappers()` before returning
+
+**Implementation detail:** `httpproxy.Config.ProxyFunc()` returns `func(*url.URL) (*url.URL, error)` but `http.Transport.Proxy` expects `func(*http.Request) (*url.URL, error)`. The adapter closure extracts `req.URL`:
+```go
+t.Proxy = func(req *http.Request) (*url.URL, error) {
+    return proxyFunc(req.URL)
+}
+```
 
 ### idp_conversions.go
 
-Add `httpProxy, httpsProxy, noProxy string` and `proxyCAData []byte` params to:
-- `discoverOpenIDURLs()` -- use `TransportForCARefWithProxy()` instead of `TransportForCARef()`
-- `checkOIDCPasswordGrantFlow()` -- same change
-- `convertProviderConfigToIDPData()` -- pass through
-- `convertIdentityProviders()` -- pass through
+Added `httpProxy, httpsProxy, noProxy string` and `proxyCAData []byte` params to the entire call chain:
+- `convertIdentityProviders()` → `convertProviderConfigToIDPData()` → `discoverOpenIDURLs()` / `checkOIDCPasswordGrantFlow()`
+
+In `discoverOpenIDURLs()` and `checkOIDCPasswordGrantFlow()`, the transport call is conditional: use `TransportForCARefWithProxy` only when proxy values or CA data are present, otherwise use the existing `TransportForCARef` to keep the default `http.ProxyFromEnvironment` behavior.
+
+**Naming fix:** `checkOIDCPasswordGrantFlow` had a variable named `transport` shadowing the package import. Renamed to `rt` (round tripper) to match the naming in `discoverOpenIDURLs`.
 
 ### observe_idps.go
 
-In `ObserveIdentityProviders()`, resolve proxy via the lister, pass to `convertIdentityProviders()`.
+Import conflict: both `configobservation` (local) and `configobserver` (library-go) are used. Resolved by aliasing: `localconfigobservation "github.com/openshift/cluster-authentication-operator/pkg/controllers/configobservation"`.
+
+Proxy resolution in `ObserveIdentityProviders()` uses the `GetComponentProxyConfig` helper, logs errors, and loads the component proxy CA from `openshift-authentication-operator/auth-proxy-ca` (copied there by Step 3).
 
 ### interfaces.go
 
-Add to `Listers` struct:
+Added three fields to `Listers` struct:
 ```go
-OperatorAuthLister_  operatorv1listers.AuthenticationLister
-FeatureGateAccessor_ featuregates.FeatureGateAccess
-OpAuthConfigMapLister_ corelistersv1.ConfigMapLister  // for openshift-authentication-operator
+OperatorAuthLister          operatorv1listers.AuthenticationLister
+FeatureGateAccessor         featuregates.FeatureGateAccess
+OperatorNamespaceConfigMaps corelistersv1.ConfigMapLister
 ```
 
-Add accessor methods.
+No accessor methods added -- fields accessed directly (matching existing pattern for `OAuthLister_`).
 
 ### observe_config_controller.go
 
-Update `NewConfigObserver()` to accept:
+New params for `NewConfigObserver()`:
 ```go
-operatorAuthLister operatorv1listers.AuthenticationLister,
+operatorAuthInformer operatorv1informers.AuthenticationInformer,
 featureGateAccessor featuregates.FeatureGateAccess,
-opAuthOperatorConfigMapInformer coreinformers.ConfigMapInformer,
 ```
 
-Wire into `Listers` struct. Add informer to watched informers.
+The operator auth informer and `openshift-authentication-operator` ConfigMap informer are registered in `preRunCacheSynced` and `informers`. The operator auth lister is obtained from the informer; nil-guarded if the informer is nil.
+
+Import: `operatorv1informers "github.com/openshift/client-go/operator/informers/externalversions/operator/v1"` and `operatorv1listers "github.com/openshift/client-go/operator/listers/operator/v1"`.
 
 ### starter.go
 
-Update `configObserver` construction (~line 185) with new params.
+Config observer wiring updated to pass:
+```go
+informerFactories.operatorInformer.Operator().V1().Authentications(),
+featureGateAccessor,
+```
+
+### Test updates
+
+All test call sites in `idp_conversions_test.go` updated with `"", "", "", nil` for the new proxy params to preserve existing behavior.
 
 ---
 
@@ -216,73 +244,109 @@ featureGateAccessor featuregates.FeatureGateAccess
 clusterProxyLister  configv1listers.ProxyLister
 ```
 
-Update `NewProxyConfigChecker()` signature with new params + `operatorAuthInformer`.
+New params for `NewProxyConfigChecker()`:
+```go
+operatorAuthLister operatorv1listers.AuthenticationLister,
+featureGateAccessor featuregates.FeatureGateAccess,
+clusterProxyLister configv1listers.ProxyLister,
+operatorAuthInformer factory.Informer,
+```
 
-In `sync()`:
-1. Check feature gate. If enabled, resolve component proxy via `ResolveProxyConfig()`.
-2. If component proxy is configured (non-nil `spec.proxy`):
-   - Build proxy functions from resolved values
-   - Load component CA from `openshift-authentication-operator/auth-proxy-ca` if `TrustedCA.Name` is set
-   - Test OAuth route reachability through component proxy
-   - Skip cluster-wide proxy validation
-3. If component proxy is nil, run existing validation.
+The `operatorAuthInformer` is conditionally added to the factory builder (`c.WithInformers()`) if non-nil.
 
-Update wiring in `starter.go` (~line 326).
+In `sync()`, component proxy check runs first (before the existing cluster-wide proxy check) via `GetComponentProxyConfig` helper (error logged at Warning level). If `spec.proxy` is non-nil, `validateComponentProxy()` is called and the method returns early -- skipping the cluster-wide proxy validation.
+
+New method `validateComponentProxy()`:
+- Resolves proxy via `common.ResolveProxyConfig(authProxy, nil)`
+- If all values are empty (explicit no-proxy), logs and returns nil
+- Loads CA pool from existing `caConfigMaps` + component proxy CA from `openshift-authentication-operator/auth-proxy-ca`
+- Builds proxy-aware and proxy-less HTTP clients
+- Calls existing `checkProxyConfig()` to test OAuth route reachability
+
+### starter.go
+
+Proxy config controller wiring updated to pass:
+```go
+informerFactories.operatorInformer.Operator().V1().Authentications().Lister(),
+featureGateAccessor,
+informerFactories.operatorConfigInformer.Config().V1().Proxies().Lister(),
+informerFactories.operatorInformer.Operator().V1().Authentications().Informer(),
+```
 
 ---
 
 ## Step 6: Upgradeable condition (2f)
 
-Add logic in the deployment controller's `Sync()` (since it already has all needed listers):
+**File:** `pkg/controllers/deployment/deployment_controller.go`
 
-When feature gate is enabled and `spec.proxy != nil`:
-- Update operator status with condition `AuthenticationComponentProxyUpgradeable=False`
-  - Reason: `ComponentProxyConfigured`
-  - Message explaining TechPreview restriction
+Added in the deployment controller's `Sync()` right after proxy resolution. Uses `operatorClient.ApplyOperatorStatus()` with `applyoperatorv1.OperatorCondition()` -- same pattern as `UnsupportedConfigOverridesUpgradeable` in library-go.
 
-When feature gate is enabled and `spec.proxy == nil`:
-- Set condition `AuthenticationComponentProxyUpgradeable=True`
+When `authProxy != nil` (feature gate enabled and spec.proxy is set):
+- Sets `AuthenticationComponentProxyUpgradeable=False`
+- Reason: `ComponentProxyConfigured`
+- Message: explains TechPreview restriction
 
-When feature gate is disabled:
-- Remove/don't set the condition
+When `authProxy == nil` (gate disabled or proxy not set): no condition is set (no-op).
 
-Use `v1helpers.UpdateStatus()` on the operator client, following the same pattern as other controllers that set conditions.
+The condition is only set, never cleared to True -- once spec.proxy is removed, the condition simply stops being refreshed and the status controller in library-go handles the rest (conditions without the `Upgradeable` type default to True).
+
+**Implementation detail:** Uses `applyoperatorv1 "github.com/openshift/client-go/operator/applyconfigurations/operator/v1"` for the apply configuration builder. The field name passed to `ApplyOperatorStatus()` is `"OAuthServerDeployment"` identifying this controller instance.
 
 ---
 
 ## Feature gate guard pattern
 
-At every call site, before accessing `spec.proxy`:
+All call sites use the `GetComponentProxyConfig` helper:
+
 ```go
-featureGates, err := c.featureGateAccessor.CurrentFeatureGates()
-if err != nil || !featureGates.Enabled(features.FeatureGateAuthenticationComponentProxy) {
-    // existing behavior, pass nil for authProxy
+authProxy, err := common.GetComponentProxyConfig(c.featureGateAccessor, c.operatorAuthLister)
+if err != nil {
+    klog.Warningf("failed to get component proxy config, falling back to cluster-wide proxy: %v", err)
 }
 ```
 
-When the gate is off, `ResolveProxyConfig(nil, clusterProxy)` returns cluster-wide proxy values -- identical to today.
+The helper encapsulates nil-safety, feature gate check, and lister access. Returns `(nil, nil)` when the gate is disabled, not observed, or the resource is not found. Returns a non-nil error only on unexpected lister failures -- callers log and fall back. When `authProxy` is nil, `ResolveProxyConfig(nil, clusterProxy)` returns cluster-wide proxy values -- identical to today.
 
 ---
 
-## Implementation order
+## Key implementation decisions
 
-1. **Step 1** (proxy helper) -- no deps
-2. **Step 2** (deployment injection) -- depends on 1
-3. **Step 3** (CA syncing + mount) -- depends on 1, 2
-4. **Step 4** (operator transport) -- depends on 1, 3 (needs CA in operator namespace)
-5. **Step 5** (validation) -- depends on 1
-6. **Step 6** (upgradeable) -- depends on 1, 2
+1. **Direct ConfigMap copy vs resourceSyncController:** `SyncConfigMap()` and `SyncConfigMapConditionally()` register fixed source names at startup. The component proxy CA source name is dynamic (`spec.proxy.trustedCA.name`), so we use `resourceapply.ApplyConfigMap()` directly in the deployment controller.
+
+2. **Source namespace informer:** The deployment controller now watches `openshift-config` ConfigMaps via `kubeInformersForSourceNamespace`. This ensures changes to the source CA ConfigMap trigger a controller re-sync and ConfigMap re-copy.
+
+3. **`v4-0-config-` prefix naming:** The synced ConfigMap in `openshift-authentication` uses this prefix so it's automatically included in `getConfigResourceVersions()` deployment hash tracking.
+
+4. **Conditional transport creation:** In `idp_conversions.go`, `TransportForCARefWithProxy` is only used when proxy values or CA data are present. Otherwise `TransportForCARef` is used, preserving the existing `http.ProxyFromEnvironment` behavior.
+
+5. **No `bindata/` changes:** The entrypoint append and volume/mount are injected dynamically in the deployment controller, not in the static YAML template. This matches the pattern used for custom router certs.
+
+---
+
+## Files changed
+
+| File | Change |
+|---|---|
+| `pkg/controllers/common/proxy.go` | New: `GetComponentProxyConfig()`, `ResolveProxyConfig()` |
+| `pkg/controllers/common/proxy_test.go` | New: unit tests |
+| `pkg/controllers/deployment/deployment_controller.go` | New fields, proxy resolution, CA sync, upgradeable condition |
+| `pkg/controllers/deployment/default_deployment.go` | Changed signature to accept resolved proxy strings |
+| `pkg/transport/transport.go` | New: `TransportForCARefWithProxy()`, renamed `net` → `knet` |
+| `pkg/controllers/configobservation/oauth/idp_conversions.go` | Threaded proxy params through call chain |
+| `pkg/controllers/configobservation/oauth/idp_conversions_test.go` | Updated call sites with nil proxy params |
+| `pkg/controllers/configobservation/oauth/observe_idps.go` | Proxy resolution, import alias |
+| `pkg/controllers/configobservation/interfaces.go` | Added lister/accessor fields |
+| `pkg/controllers/configobservation/configobservercontroller/observe_config_controller.go` | New params, informer registration |
+| `pkg/controllers/proxyconfig/proxyconfig_controller.go` | Component proxy validation, new fields |
+| `pkg/operator/starter.go` | Updated wiring for all modified controllers |
 
 ---
 
 ## Verification
 
-1. `go build ./...` -- compiles
-2. `go test ./pkg/controllers/common/...` -- proxy resolution tests
-3. `go test ./pkg/controllers/deployment/...` -- deployment env var and CA injection tests
-4. `go test ./pkg/transport/...` -- transport proxy override tests
-5. `go test ./pkg/controllers/configobservation/...` -- config observer tests (nil proxy = existing behavior)
-6. `go test ./pkg/controllers/proxyconfig/...` -- validation controller tests
-7. `go vet ./...` and `go test ./...` -- full pass
+1. `go build ./...` -- compiles clean
+2. `go vet ./pkg/...` -- no issues
+3. `go test ./pkg/...` -- all unit tests pass
+4. E2E tests (`test/e2e/`) fail locally with "no server defined" -- expected, requires a running cluster
 
-All existing tests pass with nil proxy parameter (backward compatible).
+All existing tests pass with nil proxy parameters (backward compatible).
