@@ -1,6 +1,7 @@
 package v1
 
 import (
+	configv1 "github.com/openshift/api/config/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -33,6 +34,59 @@ type Authentication struct {
 
 type AuthenticationSpec struct {
 	OperatorSpec `json:",inline"`
+
+	// proxy configures proxy settings specifically for authentication
+	// components (the OAuth server and the operator itself).
+	// When set, these values override the cluster-wide proxy
+	// (proxy.config.openshift.io/cluster) for authentication operands only.
+	// When set to an empty struct (proxy: {}), authentication components
+	// will not use any proxy, even if a cluster-wide proxy is configured.
+	// When omitted (nil), the cluster-wide proxy is used, preserving
+	// existing behavior.
+	// +openshift:enable:FeatureGate=AuthenticationComponentProxy
+	// +optional
+	Proxy *AuthenticationProxyConfig `json:"proxy,omitempty"`
+}
+
+// AuthenticationProxyConfig holds proxy configuration scoped to
+// authentication components (the OAuth server and the cluster
+// authentication operator).
+// +kubebuilder:validation:MinProperties=0
+type AuthenticationProxyConfig struct {
+	// httpProxy is the URL of the proxy for HTTP requests.
+	// When set, authentication components will use this proxy for all
+	// outbound HTTP connections to external identity providers.
+	// When omitted, no HTTP proxy is configured for authentication
+	// components (unless inherited from the cluster-wide proxy).
+	// +optional
+	HTTPProxy string `json:"httpProxy,omitempty"`
+
+	// httpsProxy is the URL of the proxy for HTTPS requests.
+	// When set, authentication components will use this proxy for all
+	// outbound HTTPS connections to external identity providers,
+	// including OIDC discovery, token exchange, and user info requests.
+	// When omitted, no HTTPS proxy is configured for authentication
+	// components (unless inherited from the cluster-wide proxy).
+	// +optional
+	HTTPSProxy string `json:"httpsProxy,omitempty"`
+
+	// noProxy is a comma-separated list of hostnames and/or CIDRs and/or IPs
+	// for which the proxy should not be used.
+	// When set, requests to matching destinations bypass the configured
+	// httpProxy and httpsProxy.
+	// When omitted, no proxy bypass rules are configured for authentication
+	// components (unless inherited from the cluster-wide proxy).
+	// +optional
+	NoProxy string `json:"noProxy,omitempty"`
+
+	// trustedCA is a reference to a ConfigMap in the openshift-config
+	// namespace containing a CA certificate bundle under the key
+	// "ca-bundle.crt". This CA bundle is appended to the system trust
+	// store and used for proxy TLS connections by authentication components.
+	// When omitted, only the system trust store (including any cluster-wide
+	// proxy CA) is used.
+	// +optional
+	TrustedCA configv1.ConfigMapNameReference `json:"trustedCA,omitempty"`
 }
 
 type AuthenticationStatus struct {
