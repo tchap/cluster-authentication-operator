@@ -23,6 +23,7 @@ import (
 	configv1 "github.com/openshift/api/config/v1"
 	osinv1 "github.com/openshift/api/osin/v1"
 	"github.com/openshift/cluster-authentication-operator/pkg/operator/datasync"
+	"github.com/openshift/cluster-authentication-operator/pkg/transport"
 	"github.com/openshift/library-go/pkg/crypto"
 )
 
@@ -210,7 +211,10 @@ func Test_convertProviderConfigToIDPData(t *testing.T) {
 				tt.providerConfig.OpenID.Issuer = server.URL
 			}
 
-			got, err := convertProviderConfigToIDPData(cmLister, secretLister, tt.providerConfig, syncData, 0, "", "", "", nil)
+			buildTransport := func(caConfigMapName, key string) (http.RoundTripper, error) {
+				return transport.TransportForCARef(cmLister, caConfigMapName, key)
+			}
+			got, err := convertProviderConfigToIDPData(cmLister, secretLister, tt.providerConfig, syncData, 0, buildTransport)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("convertProviderConfigToIDPData() error = %v, wantErr %v", err, tt.wantErr)
 				return
@@ -304,17 +308,19 @@ func TestCheckOIDCPasswordGrantFlowCaching(t *testing.T) {
 	require.NoError(t, indexer.Add(secret))
 	cmLister := corelistersv1.NewConfigMapLister(indexer)
 	secretLister := corelistersv1.NewSecretLister(indexer)
+	buildTransport := func(caConfigMapName, key string) (http.RoundTripper, error) {
+		return transport.TransportForCARef(cmLister, caConfigMapName, key)
+	}
 
 	t.Run("5xx responses are not cached", func(t *testing.T) {
 		shouldError = true
 		result, err := checkOIDCPasswordGrantFlow(
-			cmLister,
 			secretLister,
 			server.URL+"/token",
 			"test-client",
 			configv1.ConfigMapNameReference{Name: ""},
 			configv1.SecretNameReference{Name: "test-secret"},
-			"", "", "", nil,
+			buildTransport,
 		)
 
 		require.NoError(t, err)
@@ -326,13 +332,12 @@ func TestCheckOIDCPasswordGrantFlowCaching(t *testing.T) {
 		responseContent = `{"error": "invalid_grant"}`
 		shouldError = false
 		result, err := checkOIDCPasswordGrantFlow(
-			cmLister,
 			secretLister,
 			server.URL+"/token",
 			"test-client",
 			configv1.ConfigMapNameReference{Name: ""},
 			configv1.SecretNameReference{Name: "test-secret"},
-			"", "", "", nil,
+			buildTransport,
 		)
 
 		require.NoError(t, err)
@@ -346,13 +351,12 @@ func TestCheckOIDCPasswordGrantFlowCaching(t *testing.T) {
 
 		shouldError = true
 		res1, err := checkOIDCPasswordGrantFlow(
-			cmLister,
 			secretLister,
 			server.URL+"/token",
 			"test-client",
 			configv1.ConfigMapNameReference{Name: ""},
 			configv1.SecretNameReference{Name: "test-secret"},
-			"", "", "", nil,
+			buildTransport,
 		)
 		require.NoError(t, err)
 		require.False(t, res1)
@@ -362,13 +366,12 @@ func TestCheckOIDCPasswordGrantFlowCaching(t *testing.T) {
 		responseContent = `{"error": "invalid_grant"}`
 		shouldError = false
 		res2, err := checkOIDCPasswordGrantFlow(
-			cmLister,
 			secretLister,
 			server.URL+"/token",
 			"test-client",
 			configv1.ConfigMapNameReference{Name: ""},
 			configv1.SecretNameReference{Name: "test-secret"},
-			"", "", "", nil,
+			buildTransport,
 		)
 		require.NoError(t, err)
 		require.True(t, res2)

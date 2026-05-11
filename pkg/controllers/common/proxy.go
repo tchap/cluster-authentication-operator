@@ -13,9 +13,9 @@ import (
 
 // GetComponentProxyConfig returns the component-scoped proxy configuration
 // from operator.openshift.io/v1 Authentication if the feature gate is enabled.
-// Returns (nil, nil) when the gate is disabled or not yet observed.
-// Returns a non-nil error when the gate is enabled but the resource cannot
-// be read -- callers should log the error and fall back to cluster-wide proxy.
+// Returns (nil, nil) when the gate is disabled or the resource is not found.
+// Returns a non-nil error when feature gates cannot be read or the lister
+// fails -- callers should log the error and fall back to cluster-wide proxy.
 func GetComponentProxyConfig(
 	featureGateAccessor featuregates.FeatureGateAccess,
 	operatorAuthLister operatorv1listers.AuthenticationLister,
@@ -25,7 +25,7 @@ func GetComponentProxyConfig(
 	}
 	featureGates, err := featureGateAccessor.CurrentFeatureGates()
 	if err != nil {
-		return nil, nil
+		return nil, fmt.Errorf("failed to get current feature gates: %v", err)
 	}
 	if !featureGates.Enabled(features.FeatureGateAuthenticationComponentProxy) {
 		return nil, nil

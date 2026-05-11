@@ -166,6 +166,8 @@ This runs after the existing system trust copy, so the result is: system trust +
 
 Renamed `net` import to `knet` (alias for `k8s.io/apimachinery/pkg/util/net`) to avoid conflict with new imports. Added `net/url`, `golang.org/x/net/http/httpproxy`.
 
+New type `CARefTransportFunc` -- a function that builds an `http.RoundTripper` for a given CA ConfigMap reference with cmLister and proxy settings captured in the closure.
+
 New function `TransportForCARefWithProxy()`:
 - Loads CA from ConfigMap (same as `TransportForCARef`)
 - If `extraCAData` is non-empty, appends to the CA cert pool
@@ -183,29 +185,44 @@ t.Proxy = func(req *http.Request) (*url.URL, error) {
 
 ### idp_conversions.go
 
-Added `httpProxy, httpsProxy, noProxy string` and `proxyCAData []byte` params to the entire call chain:
-- `convertIdentityProviders()` → `convertProviderConfigToIDPData()` → `discoverOpenIDURLs()` / `checkOIDCPasswordGrantFlow()`
+Instead of threading 4 proxy params through the call chain, a single `transport.CARefTransportFunc` closure is passed. This captures the cmLister and any proxy settings, so leaf functions don't need to know about proxy at all.
 
-In `discoverOpenIDURLs()` and `checkOIDCPasswordGrantFlow()`, the transport call is conditional: use `TransportForCARefWithProxy` only when proxy values or CA data are present, otherwise use the existing `TransportForCARef` to keep the default `http.ProxyFromEnvironment` behavior.
+Changed signatures:
+- `convertIdentityProviders(cmLister, secretsLister, idps, buildTransport)` -- 1 new param
+- `convertProviderConfigToIDPData(cmLister, secretsLister, ..., buildTransport)` -- same
+- `discoverOpenIDURLs(issuer, key, ca, buildTransport)` -- `cmLister` removed (only used for transport)
+- `checkOIDCPasswordGrantFlow(secretsLister, ..., buildTransport)` -- `cmLister` removed (only used for transport)
 
-**Naming fix:** `checkOIDCPasswordGrantFlow` had a variable named `transport` shadowing the package import. Renamed to `rt` (round tripper) to match the naming in `discoverOpenIDURLs`.
+The leaf functions call `buildTransport(ca.Name, key)` instead of `transport.TransportForCARef(cmLister, ca.Name, key)`.
+
+**Naming fix:** `checkOIDCPasswordGrantFlow` had a variable named `transport` shadowing the package import. Renamed to `rt`.
 
 ### observe_idps.go
 
-Import conflict: both `configobservation` (local) and `configobserver` (library-go) are used. Resolved by aliasing: `localconfigobservation "github.com/openshift/cluster-authentication-operator/pkg/controllers/configobservation"`.
+Import conflict: both `configobservation` (local) and `configobserver` (library-go) are used. Resolved by aliasing: `localconfigobservation "..."`.
 
-Proxy resolution in `ObserveIdentityProviders()` uses the `GetComponentProxyConfig` helper, logs errors, and loads the component proxy CA from `openshift-authentication-operator/auth-proxy-ca` (copied there by Step 3).
+Builds the `CARefTransportFunc` closure once in `ObserveIdentityProviders()`:
+```go
+buildTransport := transport.CARefTransportFunc(func(caConfigMapName, key string) (http.RoundTripper, error) {
+    return transport.TransportForCARef(listers.ConfigMapLister, caConfigMapName, key)
+})
+if authProxy != nil {
+    buildTransport = func(caConfigMapName, key string) (http.RoundTripper, error) {
+        return transport.TransportForCARefWithProxy(listers.ConfigMapLister, caConfigMapName, key, ...)
+    }
+}
+```
+
+Uses `GetComponentProxyConfig` helper, logs errors, and loads the component proxy CA from `openshift-authentication-operator/auth-proxy-ca` (copied there by Step 3).
 
 ### interfaces.go
 
-Added three fields to `Listers` struct:
+Added three fields to `Listers` struct (no trailing underscores, accessed directly):
 ```go
 OperatorAuthLister          operatorv1listers.AuthenticationLister
 FeatureGateAccessor         featuregates.FeatureGateAccess
 OperatorNamespaceConfigMaps corelistersv1.ConfigMapLister
 ```
-
-No accessor methods added -- fields accessed directly (matching existing pattern for `OAuthLister_`).
 
 ### observe_config_controller.go
 
@@ -229,7 +246,7 @@ featureGateAccessor,
 
 ### Test updates
 
-All test call sites in `idp_conversions_test.go` updated with `"", "", "", nil` for the new proxy params to preserve existing behavior.
+Test call sites in `idp_conversions_test.go` build a `CARefTransportFunc` closure wrapping `transport.TransportForCARef` with the test's cmLister, then pass it to the updated function signatures.
 
 ---
 
@@ -317,7 +334,7 @@ The helper encapsulates nil-safety, feature gate check, and lister access. Retur
 
 3. **`v4-0-config-` prefix naming:** The synced ConfigMap in `openshift-authentication` uses this prefix so it's automatically included in `getConfigResourceVersions()` deployment hash tracking.
 
-4. **Conditional transport creation:** In `idp_conversions.go`, `TransportForCARefWithProxy` is only used when proxy values or CA data are present. Otherwise `TransportForCARef` is used, preserving the existing `http.ProxyFromEnvironment` behavior.
+4. **Transport builder closure:** Instead of threading 4 proxy params through the IDP conversion call chain, a `transport.CARefTransportFunc` closure is built once at the top level and passed down. Leaf functions (`discoverOpenIDURLs`, `checkOIDCPasswordGrantFlow`) call the closure without knowing about proxy. This also allowed removing `cmLister` from their signatures since it was only used for transport creation.
 
 5. **No `bindata/` changes:** The entrypoint append and volume/mount are injected dynamically in the deployment controller, not in the static YAML template. This matches the pattern used for custom router certs.
 
@@ -331,10 +348,10 @@ The helper encapsulates nil-safety, feature gate check, and lister access. Retur
 | `pkg/controllers/common/proxy_test.go` | New: unit tests |
 | `pkg/controllers/deployment/deployment_controller.go` | New fields, proxy resolution, CA sync, upgradeable condition |
 | `pkg/controllers/deployment/default_deployment.go` | Changed signature to accept resolved proxy strings |
-| `pkg/transport/transport.go` | New: `TransportForCARefWithProxy()`, renamed `net` → `knet` |
-| `pkg/controllers/configobservation/oauth/idp_conversions.go` | Threaded proxy params through call chain |
-| `pkg/controllers/configobservation/oauth/idp_conversions_test.go` | Updated call sites with nil proxy params |
-| `pkg/controllers/configobservation/oauth/observe_idps.go` | Proxy resolution, import alias |
+| `pkg/transport/transport.go` | New: `CARefTransportFunc` type, `TransportForCARefWithProxy()`, renamed `net` → `knet` |
+| `pkg/controllers/configobservation/oauth/idp_conversions.go` | Accept `CARefTransportFunc`, removed `cmLister` from leaf functions |
+| `pkg/controllers/configobservation/oauth/idp_conversions_test.go` | Build transport closure, updated call sites |
+| `pkg/controllers/configobservation/oauth/observe_idps.go` | Build transport closure, proxy resolution, import alias |
 | `pkg/controllers/configobservation/interfaces.go` | Added lister/accessor fields |
 | `pkg/controllers/configobservation/configobservercontroller/observe_config_controller.go` | New params, informer registration |
 | `pkg/controllers/proxyconfig/proxyconfig_controller.go` | Component proxy validation, new fields |

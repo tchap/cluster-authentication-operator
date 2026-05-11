@@ -1,6 +1,8 @@
 package oauth
 
 import (
+	"net/http"
+
 	"k8s.io/klog/v2"
 
 	"k8s.io/apimachinery/pkg/api/equality"
@@ -13,6 +15,7 @@ import (
 	"github.com/openshift/cluster-authentication-operator/pkg/controllers/common"
 	localconfigobservation "github.com/openshift/cluster-authentication-operator/pkg/controllers/configobservation"
 	"github.com/openshift/cluster-authentication-operator/pkg/operator/datasync"
+	"github.com/openshift/cluster-authentication-operator/pkg/transport"
 )
 
 var identityProvidersMounts = []string{"volumesToMount", "identityProviders"}
@@ -51,25 +54,30 @@ func ObserveIdentityProviders(genericlisters configobserver.Listers, recorder ev
 		return existingConfig, append(errs, err)
 	}
 
-	// resolve component-scoped proxy if feature gate is enabled
-	var httpProxy, httpsProxy, noProxy string
-	var proxyCAData []byte
+	// build transport function, optionally with component-scoped proxy
+	buildTransport := transport.CARefTransportFunc(func(caConfigMapName, key string) (http.RoundTripper, error) {
+		return transport.TransportForCARef(listers.ConfigMapLister, caConfigMapName, key)
+	})
 	authProxy, proxyErr := common.GetComponentProxyConfig(listers.FeatureGateAccessor, listers.OperatorAuthLister)
 	if proxyErr != nil {
 		klog.Warningf("failed to get component proxy config, falling back to cluster-wide proxy: %v", proxyErr)
 	}
 	if authProxy != nil {
-		httpProxy, httpsProxy, noProxy = common.ResolveProxyConfig(authProxy, nil)
+		httpProxy, httpsProxy, noProxy := common.ResolveProxyConfig(authProxy, nil)
+		var proxyCAData []byte
 		if len(authProxy.TrustedCA.Name) > 0 && listers.OperatorNamespaceConfigMaps != nil {
 			if caCM, caErr := listers.OperatorNamespaceConfigMaps.ConfigMaps("openshift-authentication-operator").Get("auth-proxy-ca"); caErr == nil {
 				proxyCAData = []byte(caCM.Data["ca-bundle.crt"])
 			}
 		}
+		buildTransport = func(caConfigMapName, key string) (http.RoundTripper, error) {
+			return transport.TransportForCARefWithProxy(listers.ConfigMapLister, caConfigMapName, key, httpProxy, httpsProxy, noProxy, proxyCAData)
+		}
 	}
 
 	// convert identity providers from config to oauth-configuration API and
 	// extract the CMs and Secrets that need to be synchronized to the target NS
-	convertedObservedIdentityProviders, observedSyncData, idpErrs := convertIdentityProviders(listers.ConfigMapLister, listers.SecretsLister, oauthConfig.Spec.IdentityProviders, httpProxy, httpsProxy, noProxy, proxyCAData)
+	convertedObservedIdentityProviders, observedSyncData, idpErrs := convertIdentityProviders(listers.ConfigMapLister, listers.SecretsLister, oauthConfig.Spec.IdentityProviders, buildTransport)
 	if len(idpErrs) > 0 {
 		return existingConfig, append(errs, idpErrs...)
 	}

@@ -16,6 +16,10 @@ import (
 
 // TODO move all this to library-go
 
+// CARefTransportFunc builds an http.RoundTripper for a given CA ConfigMap
+// reference. The cmLister and any proxy settings are captured in the closure.
+type CARefTransportFunc func(caConfigMapName, key string) (http.RoundTripper, error)
+
 // TransportFor returns an http.Transport for the given ca and client cert data (which may be empty)
 func TransportFor(serverName string, caData, certData, keyData []byte) (http.RoundTripper, error) {
 	transport, err := transportForInner(serverName, caData, certData, keyData)

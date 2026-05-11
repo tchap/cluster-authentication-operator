@@ -57,15 +57,14 @@ func convertIdentityProviders(
 	cmLister corelistersv1.ConfigMapLister,
 	secretsLister corelistersv1.SecretLister,
 	identityProviders []configv1.IdentityProvider,
-	httpProxy, httpsProxy, noProxy string,
-	proxyCAData []byte,
+	buildTransport transport.CARefTransportFunc,
 ) ([]interface{}, *datasync.ConfigSyncData, []error) {
 	converted := []osinv1.IdentityProvider{}
 	syncData := datasync.NewConfigSyncData()
 	errs := []error{}
 
 	for i, idp := range defaultIDPMappingMethods(identityProviders) {
-		data, err := convertProviderConfigToIDPData(cmLister, secretsLister, &idp.IdentityProviderConfig, syncData, i, httpProxy, httpsProxy, noProxy, proxyCAData)
+		data, err := convertProviderConfigToIDPData(cmLister, secretsLister, &idp.IdentityProviderConfig, syncData, i, buildTransport)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("failed to apply IDP %s config: %v", idp.Name, err))
 			continue
@@ -118,8 +117,7 @@ func convertProviderConfigToIDPData(
 	providerConfig *configv1.IdentityProviderConfig,
 	syncData *datasync.ConfigSyncData,
 	i int,
-	httpProxy, httpsProxy, noProxy string,
-	proxyCAData []byte,
+	buildTransport transport.CARefTransportFunc,
 ) (*idpData, error) {
 	const missingProviderFmt string = "type %s was specified, but its configuration is missing"
 
@@ -245,7 +243,7 @@ func convertProviderConfigToIDPData(
 			return nil, fmt.Errorf(missingProviderFmt, providerConfig.Type)
 		}
 
-		urls, err := discoverOpenIDURLs(cmLister, openIDConfig.Issuer, corev1.ServiceAccountRootCAKey, openIDConfig.CA, httpProxy, httpsProxy, noProxy, proxyCAData)
+		urls, err := discoverOpenIDURLs(openIDConfig.Issuer, corev1.ServiceAccountRootCAKey, openIDConfig.CA, buildTransport)
 		if err != nil {
 			return nil, err
 		}
@@ -276,14 +274,12 @@ func convertProviderConfigToIDPData(
 		// challenge-redirecting IdPs to be configured with OIDC so it is safe
 		// to allow challenge-issuing flow if it's available on the OIDC side
 		challengeFlowsAllowed, err := checkOIDCPasswordGrantFlow(
-			cmLister,
 			secretsLister,
 			urls.Token,
 			openIDConfig.ClientID,
 			openIDConfig.CA,
 			openIDConfig.ClientSecret,
-			httpProxy, httpsProxy, noProxy,
-			proxyCAData,
+			buildTransport,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("error attempting password grant flow: %v", err)
@@ -318,7 +314,7 @@ func convertProviderConfigToIDPData(
 
 // discoverOpenIDURLs retrieves basic information about an OIDC server with hostname
 // given by the `issuer` argument
-func discoverOpenIDURLs(cmLister corelistersv1.ConfigMapLister, issuer, key string, ca configv1.ConfigMapNameReference, httpProxy, httpsProxy, noProxy string, proxyCAData []byte) (*osinv1.OpenIDURLs, error) {
+func discoverOpenIDURLs(issuer, key string, ca configv1.ConfigMapNameReference, buildTransport transport.CARefTransportFunc) (*osinv1.OpenIDURLs, error) {
 	issuer = strings.TrimRight(issuer, "/") // TODO make impossible via validation and remove
 
 	wellKnown := issuer + "/.well-known/openid-configuration"
@@ -327,12 +323,7 @@ func discoverOpenIDURLs(cmLister corelistersv1.ConfigMapLister, issuer, key stri
 		return nil, err
 	}
 
-	var rt http.RoundTripper
-	if len(httpProxy) > 0 || len(httpsProxy) > 0 || len(proxyCAData) > 0 {
-		rt, err = transport.TransportForCARefWithProxy(cmLister, ca.Name, key, httpProxy, httpsProxy, noProxy, proxyCAData)
-	} else {
-		rt, err = transport.TransportForCARef(cmLister, ca.Name, key)
-	}
+	rt, err := buildTransport(ca.Name, key)
 	if err != nil {
 		return nil, err
 	}
@@ -382,13 +373,11 @@ func discoverOpenIDURLs(cmLister corelistersv1.ConfigMapLister, issuer, key stri
 }
 
 func checkOIDCPasswordGrantFlow(
-	cmLister corelistersv1.ConfigMapLister,
 	secretsLister corelistersv1.SecretLister,
 	tokenURL, clientID string,
 	caRererence configv1.ConfigMapNameReference,
 	clientSecretReference configv1.SecretNameReference,
-	httpProxy, httpsProxy, noProxy string,
-	proxyCAData []byte,
+	buildTransport transport.CARefTransportFunc,
 ) (bool, error) {
 	secret, err := secretsLister.Secrets("openshift-config").Get(clientSecretReference.Name)
 	if err != nil {
@@ -407,12 +396,7 @@ func checkOIDCPasswordGrantFlow(
 		return false, fmt.Errorf("the referenced secret does not contain a value for the 'clientSecret' key")
 	}
 
-	var rt http.RoundTripper
-	if len(httpProxy) > 0 || len(httpsProxy) > 0 || len(proxyCAData) > 0 {
-		rt, err = transport.TransportForCARefWithProxy(cmLister, caRererence.Name, corev1.ServiceAccountRootCAKey, httpProxy, httpsProxy, noProxy, proxyCAData)
-	} else {
-		rt, err = transport.TransportForCARef(cmLister, caRererence.Name, corev1.ServiceAccountRootCAKey)
-	}
+	rt, err := buildTransport(caRererence.Name, corev1.ServiceAccountRootCAKey)
 	if err != nil {
 		return false, fmt.Errorf("couldn't get a transport for the referenced CA: %v", err)
 	}
