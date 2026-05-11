@@ -24,9 +24,9 @@ import (
 
 	configv1 "github.com/openshift/api/config/v1"
 	operatorv1 "github.com/openshift/api/operator/v1"
-	applyoperatorv1 "github.com/openshift/client-go/operator/applyconfigurations/operator/v1"
 	configinformer "github.com/openshift/client-go/config/informers/externalversions"
 	configv1listers "github.com/openshift/client-go/config/listers/config/v1"
+	applyoperatorv1 "github.com/openshift/client-go/operator/applyconfigurations/operator/v1"
 	operatorv1listers "github.com/openshift/client-go/operator/listers/operator/v1"
 	routeinformers "github.com/openshift/client-go/route/informers/externalversions"
 	routev1listers "github.com/openshift/client-go/route/listers/route/v1"
@@ -66,13 +66,13 @@ type oauthServerDeploymentSyncer struct {
 	deployments       appsv1client.DeploymentsGetter
 	deploymentsLister appsv1listers.DeploymentLister
 
-	configMaps     corev1client.ConfigMapsGetter
-	configMapLister corev1listers.ConfigMapLister
+	configMaps            corev1client.ConfigMapsGetter
+	configMapLister       corev1listers.ConfigMapLister
 	sourceConfigMapLister corev1listers.ConfigMapLister // openshift-config namespace
-	secretLister    corev1listers.SecretLister
-	podsLister      corev1listers.PodLister
-	proxyLister     configv1listers.ProxyLister
-	routeLister     routev1listers.RouteLister
+	secretLister          corev1listers.SecretLister
+	podsLister            corev1listers.PodLister
+	proxyLister           configv1listers.ProxyLister
+	routeLister           routev1listers.RouteLister
 
 	operatorAuthLister  operatorv1listers.AuthenticationLister
 	featureGateAccessor featuregates.FeatureGateAccess
@@ -371,7 +371,7 @@ func setRollingUpdateParameters(controlPlaneCount int32, deployment *appsv1.Depl
 const (
 	componentProxyUpgradeableCondition = "AuthenticationComponentProxyUpgradeable"
 	componentProxyCAConfigMapName      = "v4-0-config-system-auth-proxy-ca"
-	componentProxyCAMountPath     = "/var/config/system/configmaps/" + componentProxyCAConfigMapName
+	componentProxyCAMountPath          = "/var/config/system/configmaps/" + componentProxyCAConfigMapName
 )
 
 func (c *oauthServerDeploymentSyncer) setComponentProxyUpgradeableCondition(
@@ -425,18 +425,6 @@ func (c *oauthServerDeploymentSyncer) syncComponentProxyCA(
 		return fmt.Errorf("applying component proxy CA configmap to openshift-authentication: %v", err)
 	}
 
-	operatorTargetCM := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: "openshift-authentication-operator",
-			Name:      "auth-proxy-ca",
-		},
-		Data: sourceCM.Data,
-	}
-	_, _, err = resourceapply.ApplyConfigMap(ctx, c.configMaps, syncContext.Recorder(), operatorTargetCM)
-	if err != nil {
-		return fmt.Errorf("applying component proxy CA configmap to openshift-authentication-operator: %v", err)
-	}
-
 	deployment.Spec.Template.Spec.Volumes = append(deployment.Spec.Template.Spec.Volumes, corev1.Volume{
 		Name: componentProxyCAConfigMapName,
 		VolumeSource: corev1.VolumeSource{
@@ -467,8 +455,12 @@ func (c *oauthServerDeploymentSyncer) syncComponentProxyCA(
 			"fi\n",
 		componentProxyCAMountPath, componentProxyCAMountPath,
 	)
+	entrypoint := deployment.Spec.Template.Spec.Containers[0].Args[0]
+	if !strings.Contains(entrypoint, "exec oauth-server") {
+		return fmt.Errorf("could not find 'exec oauth-server' marker in container entrypoint for CA injection")
+	}
 	deployment.Spec.Template.Spec.Containers[0].Args[0] = strings.Replace(
-		deployment.Spec.Template.Spec.Containers[0].Args[0],
+		entrypoint,
 		"exec oauth-server",
 		appendBlock+"exec oauth-server",
 		1,

@@ -85,18 +85,10 @@ func NewConfigObserver(
 			configobserver.WithPrefix(o, configobservation.OAuthServerConfigPrefix))
 	}
 
+	var operatorAuthLister operatorv1listers.AuthenticationLister
 	if operatorAuthInformer != nil {
 		preRunCacheSynced = append(preRunCacheSynced, operatorAuthInformer.Informer().HasSynced)
 		informers = append(informers, operatorAuthInformer.Informer())
-	}
-
-	// watch operator namespace ConfigMaps for component proxy CA
-	opNSCMInformer := kubeInformersForNamespaces.InformersFor("openshift-authentication-operator").Core().V1().ConfigMaps()
-	preRunCacheSynced = append(preRunCacheSynced, opNSCMInformer.Informer().HasSynced)
-	informers = append(informers, opNSCMInformer.Informer())
-
-	var operatorAuthLister operatorv1listers.AuthenticationLister
-	if operatorAuthInformer != nil {
 		operatorAuthLister = operatorAuthInformer.Lister()
 	}
 
@@ -112,9 +104,8 @@ func NewConfigObserver(
 		ResourceSync:         resourceSyncer,
 		PreRunCachesSynced:   preRunCacheSynced,
 
-		OperatorAuthLister:          operatorAuthLister,
-		FeatureGateAccessor:         featureGateAccessor,
-		OperatorNamespaceConfigMaps: opNSCMInformer.Lister(),
+		OperatorAuthLister:  operatorAuthLister,
+		FeatureGateAccessor: featureGateAccessor,
 	}
 
 	// Check if the Console capability is enabled on the cluster and sync and add its informer, lister, and config observer

@@ -127,9 +127,11 @@ New method `syncComponentProxyCA()` called from `Sync()`:
 1. If `authProxy == nil` or `authProxy.TrustedCA.Name` is empty, return nil (no-op)
 2. Read source ConfigMap from `openshift-config` via `sourceConfigMapLister`
 3. Apply as `v4-0-config-system-auth-proxy-ca` in `openshift-authentication` (for the OAuth Server)
-4. Apply as `auth-proxy-ca` in `openshift-authentication-operator` (for the operator's own transport)
-5. Add volume + volume mount to the deployment
-6. Inject entrypoint append block via `strings.Replace` on the `"exec oauth-server"` marker
+4. Add volume + volume mount to the deployment
+5. Verify `"exec oauth-server"` marker exists in the entrypoint (error if missing)
+6. Inject entrypoint append block via `strings.Replace` on the marker
+
+No copy to `openshift-authentication-operator` -- the config observer and proxy validation controller read the source CA directly from `openshift-config` via the existing `ConfigMapLister`, eliminating a cross-namespace copy and extra informer.
 
 The ConfigMap in `openshift-authentication` uses the `v4-0-config-` prefix so `getConfigResourceVersions()` automatically picks it up for deployment hash tracking, triggering rollouts on CA changes.
 
@@ -166,12 +168,14 @@ This runs after the existing system trust copy, so the result is: system trust +
 
 Renamed `net` import to `knet` (alias for `k8s.io/apimachinery/pkg/util/net`) to avoid conflict with new imports. Added `net/url`, `golang.org/x/net/http/httpproxy`.
 
+New helper `loadCAData()` extracts the shared CA-loading logic (read ConfigMap, try Data then BinaryData, error if empty) used by both `TransportForCARef` and `TransportForCARefWithProxy`.
+
 New type `CARefTransportFunc` -- a function that builds an `http.RoundTripper` for a given CA ConfigMap reference with cmLister and proxy settings captured in the closure.
 
 New function `TransportForCARefWithProxy()`:
-- Loads CA from ConfigMap (same as `TransportForCARef`)
+- Loads CA from ConfigMap via `loadCAData()` (shared with `TransportForCARef`)
 - If `extraCAData` is non-empty, appends to the CA cert pool
-- Builds transport via `transportForInner()` (returns `*http.Transport`, not wrapped)
+- Always creates a dedicated `*http.Transport` (never returns `http.DefaultTransport` -- avoids mutating the global default)
 - If proxy values are non-empty, overrides `transport.Proxy` with function built from `httpproxy.Config.ProxyFunc()`
 - If all proxy values are empty, sets `transport.Proxy = nil` (explicit no-proxy)
 - Wraps with `ktransport.DebugWrappers()` before returning
@@ -199,7 +203,7 @@ The leaf functions call `buildTransport(ca.Name, key)` instead of `transport.Tra
 
 ### observe_idps.go
 
-Import conflict: both `configobservation` (local) and `configobserver` (library-go) are used. Resolved by aliasing: `localconfigobservation "..."`.
+No import alias needed -- the local package is `configobservation` and the library-go package is `configobserver` (different names, no conflict).
 
 Builds the `CARefTransportFunc` closure once in `ObserveIdentityProviders()`:
 ```go
@@ -213,16 +217,17 @@ if authProxy != nil {
 }
 ```
 
-Uses `GetComponentProxyConfig` helper, logs errors, and loads the component proxy CA from `openshift-authentication-operator/auth-proxy-ca` (copied there by Step 3).
+Uses `GetComponentProxyConfig` helper, logs errors, and loads the component proxy CA directly from `openshift-config` by name (`authProxy.TrustedCA.Name`) via the existing `listers.ConfigMapLister`.
 
 ### interfaces.go
 
-Added three fields to `Listers` struct (no trailing underscores, accessed directly):
+Added two fields to `Listers` struct (no trailing underscores, accessed directly):
 ```go
-OperatorAuthLister          operatorv1listers.AuthenticationLister
-FeatureGateAccessor         featuregates.FeatureGateAccess
-OperatorNamespaceConfigMaps corelistersv1.ConfigMapLister
+OperatorAuthLister  operatorv1listers.AuthenticationLister
+FeatureGateAccessor featuregates.FeatureGateAccess
 ```
+
+No `OperatorNamespaceConfigMaps` lister needed -- the proxy CA is read directly from `openshift-config` via the existing `ConfigMapLister`.
 
 ### observe_config_controller.go
 
@@ -232,7 +237,7 @@ operatorAuthInformer operatorv1informers.AuthenticationInformer,
 featureGateAccessor featuregates.FeatureGateAccess,
 ```
 
-The operator auth informer and `openshift-authentication-operator` ConfigMap informer are registered in `preRunCacheSynced` and `informers`. The operator auth lister is obtained from the informer; nil-guarded if the informer is nil.
+The operator auth informer is registered in `preRunCacheSynced` and `informers`. The operator auth lister is obtained from the informer; nil-guarded if the informer is nil. No operator-namespace ConfigMap informer needed (proxy CA is read from `openshift-config` via the existing informer set).
 
 Import: `operatorv1informers "github.com/openshift/client-go/operator/informers/externalversions/operator/v1"` and `operatorv1listers "github.com/openshift/client-go/operator/listers/operator/v1"`.
 
@@ -258,14 +263,12 @@ Add fields to `proxyConfigChecker`:
 ```go
 operatorAuthLister  operatorv1listers.AuthenticationLister
 featureGateAccessor featuregates.FeatureGateAccess
-clusterProxyLister  configv1listers.ProxyLister
 ```
 
 New params for `NewProxyConfigChecker()`:
 ```go
 operatorAuthLister operatorv1listers.AuthenticationLister,
 featureGateAccessor featuregates.FeatureGateAccess,
-clusterProxyLister configv1listers.ProxyLister,
 operatorAuthInformer factory.Informer,
 ```
 
@@ -276,7 +279,7 @@ In `sync()`, component proxy check runs first (before the existing cluster-wide 
 New method `validateComponentProxy()`:
 - Resolves proxy via `common.ResolveProxyConfig(authProxy, nil)`
 - If all values are empty (explicit no-proxy), logs and returns nil
-- Loads CA pool from existing `caConfigMaps` + component proxy CA from `openshift-authentication-operator/auth-proxy-ca`
+- Loads CA pool from existing `caConfigMaps` + component proxy CA from `openshift-config` by name (`authProxy.TrustedCA.Name`)
 - Builds proxy-aware and proxy-less HTTP clients
 - Calls existing `checkProxyConfig()` to test OAuth route reachability
 
@@ -286,7 +289,6 @@ Proxy config controller wiring updated to pass:
 ```go
 informerFactories.operatorInformer.Operator().V1().Authentications().Lister(),
 featureGateAccessor,
-informerFactories.operatorConfigInformer.Config().V1().Proxies().Lister(),
 informerFactories.operatorInformer.Operator().V1().Authentications().Informer(),
 ```
 
@@ -338,6 +340,14 @@ The helper encapsulates nil-safety, feature gate check, and lister access. Retur
 
 5. **No `bindata/` changes:** The entrypoint append and volume/mount are injected dynamically in the deployment controller, not in the static YAML template. This matches the pattern used for custom router certs.
 
+6. **No operator-namespace CA copy:** The config observer and proxy validation controller read the proxy CA directly from `openshift-config` by name (`authProxy.TrustedCA.Name`) via the existing cross-namespace `ConfigMapLister`. This eliminates a second `ApplyConfigMap` call, the `auth-proxy-ca` naming convention, and the `OperatorNamespaceConfigMaps` lister field.
+
+7. **Shared `loadCAData()` helper:** The CA-loading logic (read ConfigMap, try Data then BinaryData, error if empty) was duplicated between `TransportForCARef` and `TransportForCARefWithProxy`. Extracted into a shared helper to ensure consistency.
+
+8. **Dedicated transport in `TransportForCARefWithProxy`:** Unlike `transportForInner()` which may return `http.DefaultTransport`, the proxy-aware path always creates a fresh `*http.Transport`. This prevents accidental mutation of the process-wide `http.DefaultTransport.Proxy` when proxy settings are applied with no CA data.
+
+9. **Entrypoint injection guard:** `syncComponentProxyCA` verifies the `"exec oauth-server"` marker exists in the container entrypoint before attempting string replacement. Returns an error instead of silently failing if the deployment template changes.
+
 ---
 
 ## Files changed
@@ -346,15 +356,15 @@ The helper encapsulates nil-safety, feature gate check, and lister access. Retur
 |---|---|
 | `pkg/controllers/common/proxy.go` | New: `GetComponentProxyConfig()`, `ResolveProxyConfig()` |
 | `pkg/controllers/common/proxy_test.go` | New: unit tests |
-| `pkg/controllers/deployment/deployment_controller.go` | New fields, proxy resolution, CA sync, upgradeable condition |
+| `pkg/controllers/deployment/deployment_controller.go` | New fields, proxy resolution, CA sync (to operand NS only), upgradeable condition, entrypoint guard |
 | `pkg/controllers/deployment/default_deployment.go` | Changed signature to accept resolved proxy strings |
-| `pkg/transport/transport.go` | New: `CARefTransportFunc` type, `TransportForCARefWithProxy()`, renamed `net` → `knet` |
+| `pkg/transport/transport.go` | New: `loadCAData()` helper, `CARefTransportFunc` type, `TransportForCARefWithProxy()` (dedicated transport, no DefaultTransport mutation), renamed `net` → `knet` |
 | `pkg/controllers/configobservation/oauth/idp_conversions.go` | Accept `CARefTransportFunc`, removed `cmLister` from leaf functions |
 | `pkg/controllers/configobservation/oauth/idp_conversions_test.go` | Build transport closure, updated call sites |
-| `pkg/controllers/configobservation/oauth/observe_idps.go` | Build transport closure, proxy resolution, import alias |
-| `pkg/controllers/configobservation/interfaces.go` | Added lister/accessor fields |
-| `pkg/controllers/configobservation/configobservercontroller/observe_config_controller.go` | New params, informer registration |
-| `pkg/controllers/proxyconfig/proxyconfig_controller.go` | Component proxy validation, new fields |
+| `pkg/controllers/configobservation/oauth/observe_idps.go` | Build transport closure, proxy resolution, reads proxy CA from `openshift-config` directly |
+| `pkg/controllers/configobservation/interfaces.go` | Added `OperatorAuthLister`, `FeatureGateAccessor` fields |
+| `pkg/controllers/configobservation/configobservercontroller/observe_config_controller.go` | New params, operator auth informer registration |
+| `pkg/controllers/proxyconfig/proxyconfig_controller.go` | Component proxy validation, reads proxy CA from `openshift-config` directly |
 | `pkg/operator/starter.go` | Updated wiring for all modified controllers |
 
 ---

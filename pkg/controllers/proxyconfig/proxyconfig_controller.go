@@ -16,7 +16,6 @@ import (
 	"k8s.io/klog/v2"
 
 	operatorv1 "github.com/openshift/api/operator/v1"
-	configv1listers "github.com/openshift/client-go/config/listers/config/v1"
 	operatorv1listers "github.com/openshift/client-go/operator/listers/operator/v1"
 	routeinformer "github.com/openshift/client-go/route/informers/externalversions/route/v1"
 	v1 "github.com/openshift/client-go/route/listers/route/v1"
@@ -38,7 +37,6 @@ type proxyConfigChecker struct {
 
 	operatorAuthLister  operatorv1listers.AuthenticationLister
 	featureGateAccessor featuregates.FeatureGateAccess
-	clusterProxyLister  configv1listers.ProxyLister
 
 	authConfigChecker common.AuthConfigChecker
 }
@@ -54,7 +52,6 @@ func NewProxyConfigChecker(
 	operatorClient v1helpers.OperatorClient,
 	operatorAuthLister operatorv1listers.AuthenticationLister,
 	featureGateAccessor featuregates.FeatureGateAccess,
-	clusterProxyLister configv1listers.ProxyLister,
 	operatorAuthInformer factory.Informer,
 ) factory.Controller {
 	p := proxyConfigChecker{
@@ -65,7 +62,6 @@ func NewProxyConfigChecker(
 		caConfigMaps:        caConfigMaps,
 		operatorAuthLister:  operatorAuthLister,
 		featureGateAccessor: featureGateAccessor,
-		clusterProxyLister:  clusterProxyLister,
 		authConfigChecker:   authConfigChecker,
 	}
 
@@ -159,7 +155,7 @@ func (p *proxyConfigChecker) validateComponentProxy(ctx context.Context, authPro
 
 	// Load component proxy CA if configured
 	if len(authProxy.TrustedCA.Name) > 0 {
-		if caCM, caErr := p.configMapLister.ConfigMaps("openshift-authentication-operator").Get("auth-proxy-ca"); caErr == nil {
+		if caCM, caErr := p.configMapLister.ConfigMaps("openshift-config").Get(authProxy.TrustedCA.Name); caErr == nil {
 			caPool.AppendCertsFromPEM([]byte(caCM.Data["ca-bundle.crt"]))
 		}
 	}

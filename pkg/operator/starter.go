@@ -343,7 +343,6 @@ func prepareOauthOperator(
 		authOperatorInput.authenticationOperatorClient,
 		informerFactories.operatorInformer.Operator().V1().Authentications().Lister(),
 		featureGateAccessor,
-		informerFactories.operatorConfigInformer.Config().V1().Proxies().Lister(),
 		informerFactories.operatorInformer.Operator().V1().Authentications().Informer(),
 	)
 

@@ -13,7 +13,7 @@ import (
 	"github.com/openshift/library-go/pkg/operator/events"
 
 	"github.com/openshift/cluster-authentication-operator/pkg/controllers/common"
-	localconfigobservation "github.com/openshift/cluster-authentication-operator/pkg/controllers/configobservation"
+	"github.com/openshift/cluster-authentication-operator/pkg/controllers/configobservation"
 	"github.com/openshift/cluster-authentication-operator/pkg/operator/datasync"
 	"github.com/openshift/cluster-authentication-operator/pkg/transport"
 )
@@ -26,7 +26,7 @@ func ObserveIdentityProviders(genericlisters configobserver.Listers, recorder ev
 		ret = configobserver.Pruned(ret, identityProvidersPath, identityProvidersMounts)
 	}()
 
-	listers := genericlisters.(localconfigobservation.Listers)
+	listers := genericlisters.(configobservation.Listers)
 	resourceSyncer := genericlisters.ResourceSyncer()
 	errs = []error{}
 
@@ -65,8 +65,8 @@ func ObserveIdentityProviders(genericlisters configobserver.Listers, recorder ev
 	if authProxy != nil {
 		httpProxy, httpsProxy, noProxy := common.ResolveProxyConfig(authProxy, nil)
 		var proxyCAData []byte
-		if len(authProxy.TrustedCA.Name) > 0 && listers.OperatorNamespaceConfigMaps != nil {
-			if caCM, caErr := listers.OperatorNamespaceConfigMaps.ConfigMaps("openshift-authentication-operator").Get("auth-proxy-ca"); caErr == nil {
+		if len(authProxy.TrustedCA.Name) > 0 {
+			if caCM, caErr := listers.ConfigMapLister.ConfigMaps("openshift-config").Get(authProxy.TrustedCA.Name); caErr == nil {
 				proxyCAData = []byte(caCM.Data["ca-bundle.crt"])
 			}
 		}

@@ -28,9 +28,8 @@ type Listers struct {
 	OAuthLister_         configlistersv1.OAuthLister
 	IngressLister        configlistersv1.IngressLister
 
-	OperatorAuthLister          operatorv1listers.AuthenticationLister
-	FeatureGateAccessor         featuregates.FeatureGateAccess
-	OperatorNamespaceConfigMaps corelistersv1.ConfigMapLister
+	OperatorAuthLister  operatorv1listers.AuthenticationLister
+	FeatureGateAccessor featuregates.FeatureGateAccess
 
 	ResourceSync       resourcesynccontroller.ResourceSyncer
 	PreRunCachesSynced []cache.InformerSynced

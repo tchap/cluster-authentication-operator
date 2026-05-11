@@ -34,16 +34,9 @@ func TransportForCARef(cmLister corelistersv1.ConfigMapLister, caConfigMapName, 
 		return TransportFor("", nil, nil, nil)
 	}
 
-	cm, err := cmLister.ConfigMaps("openshift-config").Get(caConfigMapName)
+	caData, err := loadCAData(cmLister, caConfigMapName, key)
 	if err != nil {
 		return nil, err
-	}
-	caData := []byte(cm.Data[key])
-	if len(caData) == 0 {
-		caData = cm.BinaryData[key]
-	}
-	if len(caData) == 0 {
-		return nil, fmt.Errorf("config map %s/%s has no ca data at key %s", "openshift-config", caConfigMapName, key)
 	}
 	return TransportFor("", caData, nil, nil)
 }
@@ -61,16 +54,10 @@ func TransportForCARefWithProxy(
 ) (http.RoundTripper, error) {
 	var caData []byte
 	if len(caConfigMapName) > 0 {
-		cm, err := cmLister.ConfigMaps("openshift-config").Get(caConfigMapName)
+		var err error
+		caData, err = loadCAData(cmLister, caConfigMapName, key)
 		if err != nil {
 			return nil, err
-		}
-		caData = []byte(cm.Data[key])
-		if len(caData) == 0 {
-			caData = cm.BinaryData[key]
-		}
-		if len(caData) == 0 {
-			return nil, fmt.Errorf("config map %s/%s has no ca data at key %s", "openshift-config", caConfigMapName, key)
 		}
 	}
 
@@ -78,28 +65,49 @@ func TransportForCARefWithProxy(
 		caData = append(append([]byte{}, caData...), extraCAData...)
 	}
 
-	rt, err := transportForInner("", caData, nil, nil)
+	// Always create a dedicated transport so we never mutate http.DefaultTransport.
+	t := knet.SetTransportDefaults(&http.Transport{
+		TLSClientConfig: &tls.Config{},
+	})
+
+	if len(caData) > 0 {
+		roots := x509.NewCertPool()
+		if ok := roots.AppendCertsFromPEM(caData); !ok {
+			return nil, errors.New("error loading cert pool from ca data")
+		}
+		t.TLSClientConfig.RootCAs = roots
+	}
+
+	if len(httpProxy) > 0 || len(httpsProxy) > 0 {
+		proxyCfg := httpproxy.Config{
+			HTTPProxy:  httpProxy,
+			HTTPSProxy: httpsProxy,
+			NoProxy:    noProxy,
+		}
+		proxyFunc := proxyCfg.ProxyFunc()
+		t.Proxy = func(req *http.Request) (*url.URL, error) {
+			return proxyFunc(req.URL)
+		}
+	} else {
+		t.Proxy = nil
+	}
+
+	return ktransport.DebugWrappers(t), nil
+}
+
+func loadCAData(cmLister corelistersv1.ConfigMapLister, caConfigMapName, key string) ([]byte, error) {
+	cm, err := cmLister.ConfigMaps("openshift-config").Get(caConfigMapName)
 	if err != nil {
 		return nil, err
 	}
-
-	if t, ok := rt.(*http.Transport); ok {
-		if len(httpProxy) > 0 || len(httpsProxy) > 0 {
-			proxyCfg := httpproxy.Config{
-				HTTPProxy:  httpProxy,
-				HTTPSProxy: httpsProxy,
-				NoProxy:    noProxy,
-			}
-			proxyFunc := proxyCfg.ProxyFunc()
-			t.Proxy = func(req *http.Request) (*url.URL, error) {
-				return proxyFunc(req.URL)
-			}
-		} else {
-			t.Proxy = nil
-		}
+	caData := []byte(cm.Data[key])
+	if len(caData) == 0 {
+		caData = cm.BinaryData[key]
 	}
-
-	return ktransport.DebugWrappers(rt), nil
+	if len(caData) == 0 {
+		return nil, fmt.Errorf("config map %s/%s has no ca data at key %s", "openshift-config", caConfigMapName, key)
+	}
+	return caData, nil
 }
 
 func transportForInner(serverName string, caData, certData, keyData []byte) (http.RoundTripper, error) {
