@@ -59,7 +59,6 @@ The arrows leaving the cluster boundary (►) are the outbound calls that need p
 | OIDC discovery | CAO | IdP config change | `net.SetTransportDefaults()` (process env vars; no component-scoped override) |
 | Token exchange | OAuth Server | Every login | `knet.SetTransportDefaults()` (env vars) |
 | UserInfo / groups | OAuth Server | Every login | `knet.SetTransportDefaults()` (env vars) |
-| LDAP bind/search | OAuth Server | LDAP login | LDAP protocol (not HTTP; out of scope) |
 
 ## Problem Statement
 
@@ -152,6 +151,19 @@ The implementation spans two repositories (`openshift/api`, `cluster-authenticat
 ### Phase 2: Component-scoped proxy (cluster-authentication-operator)
 
 All code paths guarded by `FeatureGateAuthenticationComponentProxy`.
+
+#### Affected controllers and components
+
+| Controller / Component | File(s) | Role | What changes |
+|---|---|---|---|
+| **Proxy resolution helper** | `pkg/controllers/common/proxy.go` (new) | Resolves effective proxy config: component-scoped > cluster-wide > none | New `ResolveProxyConfig()` function used by all other controllers |
+| **Deployment controller** | `pkg/controllers/deployment/deployment_controller.go`, `default_deployment.go` | Builds and reconciles the OAuth Server Deployment; injects `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` env vars into the pod spec | Call `ResolveProxyConfig()` instead of reading the cluster-wide proxy directly; include resolved proxy in deployment hash to trigger rollouts on change |
+| **Config observation (IDP conversions)** | `pkg/controllers/configobservation/oauth/idp_conversions.go` | Runs OIDC discovery (`discoverOpenIDURLs()`) to validate IdP endpoints during config observation | Use new `TransportForCARefWithProxy()` so discovery calls go through the component-scoped proxy |
+| **Transport layer** | `pkg/transport/transport.go` | Builds `http.RoundTripper` for outbound calls from the operator process | Add `TransportForCARefWithProxy()` variant that overrides the env-var-based proxy with a caller-supplied proxy URL |
+| **Proxy validation controller** | `pkg/controllers/proxyconfig/proxyconfig_controller.go` | Validates proxy connectivity by testing the OAuth route's `/healthz` endpoint | Also validate the component-scoped proxy; test IdP connectivity; load component `trustedCA`; warn on missing `noProxy` entries |
+| **Trust distribution controller** | `pkg/controllers/trustdistribution/trustdistribution_controller.go` | PEM read/filter/write for CA bundles distributed to operands | Under Option B (server-side merge): merge injected system trust with component-scoped proxy CA into a single ConfigMap. Under Option A: no changes (entrypoint handles merge) |
+| **Resource sync (starter wiring)** | `pkg/operator/starter.go` | Syncs ConfigMaps/Secrets from `openshift-config` into operand namespaces | Sync the component-scoped `trustedCA` ConfigMap into `openshift-authentication` and `openshift-authentication-operator` |
+| **OAuth Server deployment manifest** | `bindata/oauth-openshift/deployment.yaml` | Deployment template for the OAuth Server pods | Add volume/mount for component CA (Option A: also extend entrypoint); update hash annotations |
 
 #### Accessing `spec.proxy` from controllers
 
@@ -405,6 +417,10 @@ Informed by code analysis and by precedent from existing enhancement proposals: 
 
 1. **Should proxy credentials be supported via a Secret reference?** The cluster-wide proxy embeds credentials in the URL. An optional `proxyCredentials` SecretNameReference would improve security. Could be a follow-up enhancement.
 
-2. **Should the operator validate proxy connectivity during config observation?** The current proxy validation controller tests OAuth route `/healthz` reachability via `httpproxy.FromEnvironment()`. Extending to test IdP endpoints through the component proxy is desirable, but the validation target may not be known at operator startup.
+2. **Should the operator validate proxy connectivity to IdP endpoints?** Today the proxy validation controller tests one thing: when a cluster-wide proxy is configured, it checks that the cluster's own OAuth route (`oauth-openshift` `/healthz`) is reachable through that proxy. This catches proxies that block traffic to the cluster's own authentication endpoint -- a configuration error the admin can fix.
 
-3. **Interaction with `unsupportedConfigOverrides`** -- should component proxy settings be overridable via the existing mechanism? Likely yes, for debugging.
+    The question is whether it should **also** test that the proxy can reach **external IdP endpoints** (e.g., `https://accounts.google.com/.well-known/openid-configuration`). This would catch a different class of misconfiguration: proxy works for cluster-internal traffic but can't reach the IdP. The IdP URLs are available from `oauth.config.openshift.io/cluster` via informers, so there is no technical barrier.
+
+    The concern is that external IdP endpoints are services the cluster doesn't control. They can be temporarily down, rate-limiting, or behind geo-restrictions. If the controller reports `Degraded` when it can't reach the IdP through the proxy, it would fire on transient IdP outages that have nothing to do with the proxy configuration itself -- noisy false positives that erode trust in the condition.
+
+
