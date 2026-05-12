@@ -22,7 +22,10 @@ type CARefTransportFunc func(caConfigMapName, key string) (http.RoundTripper, er
 
 // TransportFor returns an http.Transport for the given ca and client cert data (which may be empty)
 func TransportFor(serverName string, caData, certData, keyData []byte) (http.RoundTripper, error) {
-	transport, err := transportForInner(serverName, caData, certData, keyData)
+	if len(caData) == 0 && len(certData) == 0 && len(keyData) == 0 {
+		return ktransport.DebugWrappers(http.DefaultTransport), nil
+	}
+	transport, err := newTransport(serverName, caData, certData, keyData)
 	if err != nil {
 		return nil, err
 	}
@@ -65,17 +68,9 @@ func TransportForCARefWithProxy(
 		caData = append(append([]byte{}, caData...), extraCAData...)
 	}
 
-	// Always create a dedicated transport so we never mutate http.DefaultTransport.
-	t := knet.SetTransportDefaults(&http.Transport{
-		TLSClientConfig: &tls.Config{},
-	})
-
-	if len(caData) > 0 {
-		roots := x509.NewCertPool()
-		if ok := roots.AppendCertsFromPEM(caData); !ok {
-			return nil, errors.New("error loading cert pool from ca data")
-		}
-		t.TLSClientConfig.RootCAs = roots
+	transport, err := newTransport("", caData, nil, nil)
+	if err != nil {
+		return nil, err
 	}
 
 	if len(httpProxy) > 0 || len(httpsProxy) > 0 {
@@ -85,14 +80,14 @@ func TransportForCARefWithProxy(
 			NoProxy:    noProxy,
 		}
 		proxyFunc := proxyCfg.ProxyFunc()
-		t.Proxy = func(req *http.Request) (*url.URL, error) {
+		transport.Proxy = func(req *http.Request) (*url.URL, error) {
 			return proxyFunc(req.URL)
 		}
 	} else {
-		t.Proxy = nil
+		transport.Proxy = nil
 	}
 
-	return ktransport.DebugWrappers(t), nil
+	return ktransport.DebugWrappers(transport), nil
 }
 
 func loadCAData(cmLister corelistersv1.ConfigMapLister, caConfigMapName, key string) ([]byte, error) {
@@ -110,11 +105,10 @@ func loadCAData(cmLister corelistersv1.ConfigMapLister, caConfigMapName, key str
 	return caData, nil
 }
 
-func transportForInner(serverName string, caData, certData, keyData []byte) (http.RoundTripper, error) {
-	if len(caData) == 0 && len(certData) == 0 && len(keyData) == 0 {
-		return http.DefaultTransport, nil
-	}
-
+// newTransport creates a fresh *http.Transport with TLS configured from the
+// given parameters. Callers can further customize the returned transport
+// (e.g. proxy settings) before wrapping it with DebugWrappers.
+func newTransport(serverName string, caData, certData, keyData []byte) (*http.Transport, error) {
 	if (len(certData) == 0) != (len(keyData) == 0) {
 		return nil, errors.New("cert and key data must be specified together")
 	}

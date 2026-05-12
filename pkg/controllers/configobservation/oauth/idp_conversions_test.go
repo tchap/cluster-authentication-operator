@@ -214,7 +214,7 @@ func Test_convertProviderConfigToIDPData(t *testing.T) {
 			buildTransport := func(caConfigMapName, key string) (http.RoundTripper, error) {
 				return transport.TransportForCARef(cmLister, caConfigMapName, key)
 			}
-			got, err := convertProviderConfigToIDPData(cmLister, secretLister, tt.providerConfig, syncData, 0, buildTransport)
+			got, err := convertProviderConfigToIDPData(secretLister, tt.providerConfig, syncData, 0, buildTransport)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("convertProviderConfigToIDPData() error = %v, wantErr %v", err, tt.wantErr)
 				return
