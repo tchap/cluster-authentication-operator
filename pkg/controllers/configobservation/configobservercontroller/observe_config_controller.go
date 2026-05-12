@@ -85,6 +85,9 @@ func NewConfigObserver(
 			configobserver.WithPrefix(o, configobservation.OAuthServerConfigPrefix))
 	}
 
+	// ObserveIdentityProviders reads component proxy settings from the operator Authentication CR
+	// to build an HTTP transport for validating IDP endpoints. Register the informer so that
+	// proxy config changes trigger a re-sync and IDP re-validation.
 	var operatorAuthLister operatorv1listers.AuthenticationLister
 	if operatorAuthInformer != nil {
 		preRunCacheSynced = append(preRunCacheSynced, operatorAuthInformer.Informer().HasSynced)
