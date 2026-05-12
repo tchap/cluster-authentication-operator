@@ -54,7 +54,6 @@ type idpData struct {
 }
 
 func convertIdentityProviders(
-	cmLister corelistersv1.ConfigMapLister,
 	secretsLister corelistersv1.SecretLister,
 	identityProviders []configv1.IdentityProvider,
 	buildTransport transport.CARefTransportFunc,
@@ -64,7 +63,7 @@ func convertIdentityProviders(
 	errs := []error{}
 
 	for i, idp := range defaultIDPMappingMethods(identityProviders) {
-		data, err := convertProviderConfigToIDPData(cmLister, secretsLister, &idp.IdentityProviderConfig, syncData, i, buildTransport)
+		data, err := convertProviderConfigToIDPData(secretsLister, &idp.IdentityProviderConfig, syncData, i, buildTransport)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("failed to apply IDP %s config: %v", idp.Name, err))
 			continue
@@ -112,7 +111,6 @@ func defaultIDPMappingMethods(identityProviders []configv1.IdentityProvider) []c
 }
 
 func convertProviderConfigToIDPData(
-	cmLister corelistersv1.ConfigMapLister,
 	secretsLister corelistersv1.SecretLister,
 	providerConfig *configv1.IdentityProviderConfig,
 	syncData *datasync.ConfigSyncData,

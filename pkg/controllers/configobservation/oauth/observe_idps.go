@@ -77,7 +77,7 @@ func ObserveIdentityProviders(genericlisters configobserver.Listers, recorder ev
 
 	// convert identity providers from config to oauth-configuration API and
 	// extract the CMs and Secrets that need to be synchronized to the target NS
-	convertedObservedIdentityProviders, observedSyncData, idpErrs := convertIdentityProviders(listers.ConfigMapLister, listers.SecretsLister, oauthConfig.Spec.IdentityProviders, buildTransport)
+	convertedObservedIdentityProviders, observedSyncData, idpErrs := convertIdentityProviders(listers.SecretsLister, oauthConfig.Spec.IdentityProviders, buildTransport)
 	if len(idpErrs) > 0 {
 		return existingConfig, append(errs, idpErrs...)
 	}
