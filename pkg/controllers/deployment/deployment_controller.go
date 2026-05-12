@@ -405,6 +405,17 @@ func (c *oauthServerDeploymentSyncer) syncComponentProxyCA(
 	deployment *appsv1.Deployment,
 ) error {
 	if authProxy == nil || len(authProxy.TrustedCA.Name) == 0 {
+		_, err := c.configMapLister.ConfigMaps("openshift-authentication").Get(componentProxyCAConfigMapName)
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("getting stale component proxy CA configmap: %v", err)
+		}
+		err = c.configMaps.ConfigMaps("openshift-authentication").Delete(ctx, componentProxyCAConfigMapName, metav1.DeleteOptions{})
+		if err != nil && !errors.IsNotFound(err) {
+			return fmt.Errorf("deleting stale component proxy CA configmap: %v", err)
+		}
 		return nil
 	}
 
