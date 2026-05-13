@@ -64,6 +64,16 @@ The arrows leaving the cluster boundary (►) are the outbound calls that need p
 
 Customers in restricted environments need auth components to reach external IdPs through a proxy **without** configuring a cluster-wide proxy, which opens egress for all components.
 
+### Current workarounds
+
+There is no mechanism between "no proxy" and "proxy for everything." Customers working around this today have three options, none of which are satisfactory:
+
+1. **Cluster-wide proxy + network policy** -- enable the cluster-wide proxy, then use `NetworkPolicy` or `EgressFirewall` (OVN-Kubernetes) to restrict which pods can reach the proxy endpoint. Only auth pods get network-level egress to the proxy; everything else is blocked. This works but is fragile -- every component is configured with proxy settings, and a separate mechanism prevents most of them from using it.
+
+2. **Cluster-wide proxy + restrictive proxy ACLs** -- configure the cluster-wide proxy but lock down the proxy server itself to only forward traffic to IdP domains. Every component receives the env vars and attempts to use the proxy, but only auth-related traffic is allowed through. This leaks intent and generates noise from failed proxy connections in non-auth components.
+
+3. **Manual env var injection** -- skip the cluster-wide proxy API entirely and patch the OAuth Server and operator deployments directly with proxy env vars. This is unsupported, breaks on upgrades when the CVO reconciles the deployments, and doesn't survive operator-managed redeployments.
+
 ### Identified gaps
 
 1. **No component-scoped proxy API** -- the only proxy source is the cluster-wide `Proxy` resource.
