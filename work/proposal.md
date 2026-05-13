@@ -203,7 +203,7 @@ func ResolveProxyConfig(
     if authSpec != nil && authSpec.Proxy != nil {
         return authSpec.Proxy.HTTPProxy,
                authSpec.Proxy.HTTPSProxy,
-               authSpec.Proxy.NoProxy
+               mergeNoProxy(authSpec.Proxy.NoProxy)
     }
     if clusterProxy != nil {
         return clusterProxy.Status.HTTPProxy,
@@ -213,6 +213,13 @@ func ResolveProxyConfig(
     return "", "", ""
 }
 ```
+
+**Auto-populated `noProxy` entries.** Following the precedent set by the [Global Cluster Egress Proxy](https://github.com/openshift/enhancements/blob/master/enhancements/proxy/global-cluster-egress-proxy.md), the operator auto-appends cluster-internal addresses to the user-provided `noProxy` value when `spec.proxy` is set. This prevents auth components from accidentally routing internal traffic through the proxy.
+
+Auto-appended entries (deduplicated against user-provided values):
+- `.cluster.local`, `.svc`, `localhost`, `127.0.0.1`
+
+The CNO's `MergeUserSystemNoProxy()` additionally appends service/pod/machine network CIDRs, the internal API hostname, and platform-specific metadata IPs. These are omitted here because auth components connect to internal services via DNS names (`kubernetes.default.svc`, etc.) which are already covered by `.svc` and `.cluster.local`. The OAuth Server's kube client uses in-cluster config, not raw CIDRs or the `api-int` hostname. Network CIDRs would require adding `Network` and `Infrastructure` informers/listers across multiple controllers for no practical benefit to auth workloads.
 
 #### 2b. Trusted CA bundle syncing
 
@@ -332,10 +339,14 @@ func TransportForCARefWithProxy(
 The current controller reads proxy from process env vars (`httpproxy.FromEnvironment()`) and validates that the OAuth route's `/healthz` endpoint is reachable. When external OIDC is configured, the check is skipped entirely.
 
 Extend to validate the component-scoped proxy:
-- Test connectivity to IdP endpoints through the component proxy
+- Test connectivity to IdP endpoints through the component proxy (see below)
 - Report `ProxyConfigControllerDegraded` if misconfigured
 - Load CA from the component-scoped `trustedCA` ConfigMap
-- Validate that `noProxy` includes essential cluster-internal CIDRs; warn if entries from cluster-wide `noProxy` are missing
+
+**IdP endpoint validation.** Following the [Global Cluster Egress Proxy](https://github.com/openshift/enhancements/blob/master/enhancements/proxy/global-cluster-egress-proxy.md) precedent of validating proxy connectivity before accepting configuration, the controller should test that configured IdP endpoints (extracted from `oauth.config.openshift.io/cluster`) are reachable through the component proxy. However, unlike the cluster-wide proxy's validation endpoints (which are cluster-controlled), external IdP endpoints can experience transient outages, rate-limiting, or geo-restrictions unrelated to proxy configuration. To avoid noisy false positives:
+- Validate IdP connectivity on **configuration change only** (not on every sync loop)
+- Use a **warning condition** (not `Degraded`) for transient IdP unreachability
+- Report `Degraded` only for proxy-level failures (connection refused, TLS handshake errors with the proxy itself)
 
 #### 2f. Upgradeable condition
 
@@ -425,11 +436,3 @@ Informed by code analysis and by precedent from existing enhancement proposals: 
 ## Open Questions
 
 1. **Should proxy credentials be supported via a Secret reference?** The cluster-wide proxy embeds credentials in the URL. An optional `proxyCredentials` SecretNameReference would improve security. Could be a follow-up enhancement.
-
-2. **Should the operator validate proxy connectivity to IdP endpoints?** Today the proxy validation controller tests one thing: when a cluster-wide proxy is configured, it checks that the cluster's own OAuth route (`oauth-openshift` `/healthz`) is reachable through that proxy. This catches proxies that block traffic to the cluster's own authentication endpoint -- a configuration error the admin can fix.
-
-    The question is whether it should **also** test that the proxy can reach **external IdP endpoints** (e.g., `https://accounts.google.com/.well-known/openid-configuration`). This would catch a different class of misconfiguration: proxy works for cluster-internal traffic but can't reach the IdP. The IdP URLs are available from `oauth.config.openshift.io/cluster` via informers, so there is no technical barrier.
-
-    The concern is that external IdP endpoints are services the cluster doesn't control. They can be temporarily down, rate-limiting, or behind geo-restrictions. If the controller reports `Degraded` when it can't reach the IdP through the proxy, it would fire on transient IdP outages that have nothing to do with the proxy configuration itself -- noisy false positives that erode trust in the condition.
-
-

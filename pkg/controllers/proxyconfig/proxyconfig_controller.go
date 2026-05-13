@@ -2,20 +2,21 @@ package proxyconfig
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
 	"golang.org/x/net/http/httpproxy"
 
-	corev1lister "k8s.io/client-go/listers/core/v1"
-	"k8s.io/klog/v2"
-
+	configv1 "github.com/openshift/api/config/v1"
 	operatorv1 "github.com/openshift/api/operator/v1"
+	configv1listers "github.com/openshift/client-go/config/listers/config/v1"
 	operatorv1listers "github.com/openshift/client-go/operator/listers/operator/v1"
 	routeinformer "github.com/openshift/client-go/route/informers/externalversions/route/v1"
 	v1 "github.com/openshift/client-go/route/listers/route/v1"
@@ -25,6 +26,9 @@ import (
 	"github.com/openshift/library-go/pkg/operator/events"
 	"github.com/openshift/library-go/pkg/operator/v1helpers"
 	"github.com/openshift/library-go/pkg/route/routeapihelpers"
+
+	corev1lister "k8s.io/client-go/listers/core/v1"
+	"k8s.io/klog/v2"
 )
 
 // proxyConfigChecker reports bad proxy configurations.
@@ -35,10 +39,13 @@ type proxyConfigChecker struct {
 	routeNamespace  string
 	caConfigMaps    map[string][]string // ns -> []configmapNames
 
+	oauthLister         configv1listers.OAuthLister
 	operatorAuthLister  operatorv1listers.AuthenticationLister
 	featureGateAccessor featuregates.FeatureGateAccess
 
 	authConfigChecker common.AuthConfigChecker
+
+	lastIdPValidationHash string
 }
 
 func NewProxyConfigChecker(
@@ -50,6 +57,7 @@ func NewProxyConfigChecker(
 	caConfigMaps map[string][]string,
 	recorder events.Recorder,
 	operatorClient v1helpers.OperatorClient,
+	oauthLister configv1listers.OAuthLister,
 	operatorAuthLister operatorv1listers.AuthenticationLister,
 	featureGateAccessor featuregates.FeatureGateAccess,
 	operatorAuthInformer factory.Informer,
@@ -60,6 +68,7 @@ func NewProxyConfigChecker(
 		routeName:           routeName,
 		routeNamespace:      routeNamespace,
 		caConfigMaps:        caConfigMaps,
+		oauthLister:         oauthLister,
 		operatorAuthLister:  operatorAuthLister,
 		featureGateAccessor: featureGateAccessor,
 		authConfigChecker:   authConfigChecker,
@@ -183,7 +192,89 @@ func (p *proxyConfigChecker) validateComponentProxy(ctx context.Context, authPro
 		},
 	}
 
-	return checkProxyConfig(ctx, routeURL, noProxy, clientWithProxy, clientWithoutProxy)
+	if err := checkProxyConfig(ctx, routeURL, noProxy, clientWithProxy, clientWithoutProxy); err != nil {
+		return err
+	}
+
+	p.validateIdPConnectivity(ctx, httpProxy, httpsProxy, noProxy, caPool)
+
+	return nil
+}
+
+// validateIdPConnectivity tests that configured IdP endpoints are reachable through
+// the component proxy. Only runs on config change (tracked by hash). Reports warnings
+// for transient IdP failures instead of returning errors (which would set Degraded),
+// since external IdPs can be unreachable for reasons unrelated to proxy configuration.
+func (p *proxyConfigChecker) validateIdPConnectivity(ctx context.Context, httpProxy, httpsProxy, noProxy string, caPool *x509.CertPool) {
+	oauthConfig, err := p.oauthLister.Get("cluster")
+	if err != nil {
+		klog.V(4).Infof("unable to get oauth config for IdP validation: %v", err)
+		return
+	}
+
+	idpURLs := extractIdPURLs(oauthConfig)
+	if len(idpURLs) == 0 {
+		return
+	}
+
+	hash := computeIdPValidationHash(httpProxy, httpsProxy, noProxy, idpURLs)
+	if hash == p.lastIdPValidationHash {
+		return
+	}
+	p.lastIdPValidationHash = hash
+
+	componentProxyCfg := httpproxy.Config{
+		HTTPProxy:  httpProxy,
+		HTTPSProxy: httpsProxy,
+		NoProxy:    noProxy,
+	}
+	proxyFn := componentProxyCfg.ProxyFunc()
+
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{RootCAs: caPool},
+			Proxy: func(req *http.Request) (*url.URL, error) {
+				return proxyFn(req.URL)
+			},
+		},
+		Timeout: 10 * time.Second,
+	}
+
+	for _, idpURL := range idpURLs {
+		if err := isEndpointReachable(ctx, idpURL, client); err != nil {
+			klog.Warningf("IdP endpoint %q is unreachable through component proxy: %v", idpURL, err)
+		}
+	}
+}
+
+// extractIdPURLs returns external URLs from configured identity providers.
+func extractIdPURLs(oauthConfig *configv1.OAuth) []string {
+	var urls []string
+	for _, idp := range oauthConfig.Spec.IdentityProviders {
+		switch {
+		case idp.OpenID != nil && len(idp.OpenID.Issuer) > 0:
+			issuer := strings.TrimSuffix(idp.OpenID.Issuer, "/")
+			urls = append(urls, issuer+"/.well-known/openid-configuration")
+		case idp.GitHub != nil && len(idp.GitHub.Hostname) > 0:
+			urls = append(urls, "https://"+idp.GitHub.Hostname)
+		case idp.GitLab != nil && len(idp.GitLab.URL) > 0:
+			urls = append(urls, idp.GitLab.URL)
+		case idp.Keystone != nil && len(idp.Keystone.URL) > 0:
+			urls = append(urls, idp.Keystone.URL)
+		case idp.BasicAuth != nil && len(idp.BasicAuth.URL) > 0:
+			urls = append(urls, idp.BasicAuth.URL)
+		}
+	}
+	return urls
+}
+
+func computeIdPValidationHash(httpProxy, httpsProxy, noProxy string, idpURLs []string) string {
+	h := sha256.New()
+	fmt.Fprintf(h, "%s\n%s\n%s\n", httpProxy, httpsProxy, noProxy)
+	for _, u := range idpURLs {
+		fmt.Fprintf(h, "%s\n", u)
+	}
+	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
 // checkProxyConfig determines any mis-configuration in proxy settings by attempting

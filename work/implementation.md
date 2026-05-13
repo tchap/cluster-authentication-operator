@@ -22,7 +22,8 @@ func ResolveProxyConfig(
     clusterProxy *configv1.Proxy,
 ) (httpProxy, httpsProxy, noProxy string) {
     if authProxy != nil {
-        return authProxy.HTTPProxy, authProxy.HTTPSProxy, authProxy.NoProxy
+        return authProxy.HTTPProxy, authProxy.HTTPSProxy,
+               mergeNoProxy(authProxy.NoProxy)
     }
     if clusterProxy != nil {
         return clusterProxy.Status.HTTPProxy, clusterProxy.Status.HTTPSProxy, clusterProxy.Status.NoProxy
@@ -31,7 +32,29 @@ func ResolveProxyConfig(
 }
 ```
 
-Pure function, no feature gate logic -- callers decide whether to pass `authProxy` based on the gate. Unit tests in `proxy_test.go` covering all 4 resolution states plus partial-values case.
+Pure function, no feature gate logic -- callers decide whether to pass `authProxy` based on the gate. Signature unchanged from before -- no new parameters needed. Unit tests in `proxy_test.go` covering all 4 resolution states plus partial-values case.
+
+### noProxy auto-population
+
+Following the [Global Cluster Egress Proxy](https://github.com/openshift/enhancements/blob/master/enhancements/proxy/global-cluster-egress-proxy.md) precedent, the operator auto-appends cluster-internal addresses to the user-provided `noProxy` when component-scoped proxy is active. This prevents auth components from accidentally routing internal traffic through the proxy.
+
+```go
+func mergeNoProxy(userNoProxy string) string
+```
+
+Auto-appended entries (deduplicated against user-provided values):
+- `.cluster.local`, `.svc`, `localhost`, `127.0.0.1`
+
+The CNO's `MergeUserSystemNoProxy()` (`cluster-network-operator/pkg/util/proxyconfig/no_proxy.go`) additionally appends service/pod/machine network CIDRs, the internal API hostname, and platform-specific metadata IPs. These are omitted because auth components connect to internal services via DNS names (`kubernetes.default.svc`, etc.) which are already covered by `.svc` and `.cluster.local`. The OAuth Server's kube client uses in-cluster config, not raw CIDRs or the `api-int` hostname. Adding `Network` and `Infrastructure` informers/listers across multiple controllers would add coupling with no practical benefit to auth workloads.
+
+`mergeNoProxy()` is only called in the component-proxy branch. The cluster-wide proxy branch returns `.status.noProxy` as-is -- those defaults are already computed by the CNO.
+
+### Tests
+
+Add new tests for noProxy auto-population:
+- Component proxy with user noProxy → user entries + static defaults merged
+- Component proxy with empty noProxy → only static defaults
+- Deduplication -- user entries that overlap with defaults are not repeated
 
 Helper to get the proxy object with feature gate guarding:
 
@@ -283,6 +306,21 @@ New method `validateComponentProxy()`:
 - Builds proxy-aware and proxy-less HTTP clients
 - Calls existing `checkProxyConfig()` to test OAuth route reachability
 
+### IdP endpoint validation
+
+Following the [Global Cluster Egress Proxy](https://github.com/openshift/enhancements/blob/master/enhancements/proxy/global-cluster-egress-proxy.md) precedent of validating proxy connectivity before accepting configuration, the controller tests that configured IdP endpoints are reachable through the component proxy.
+
+Add `oauthLister configv1listers.OAuthLister` to `proxyConfigChecker`. Wire in `NewProxyConfigChecker()` and `starter.go`.
+
+New method `validateIdPConnectivity()` called from `validateComponentProxy()` after the route healthz check:
+1. Get IdP config from `oauth.config.openshift.io/cluster` via `oauthLister`
+2. Extract OIDC/OpenID issuer URLs from `spec.identityProviders`
+3. For each URL, test connectivity through the component proxy (HTTP GET to `/.well-known/openid-configuration`)
+4. **Warning, not Degraded:** Unlike proxy-level errors (connection refused to proxy itself, TLS handshake failure with the proxy), IdP unreachability is reported via `klog.Warningf` only -- external IdP endpoints can experience transient outages, rate-limiting, or geo-restrictions unrelated to proxy configuration
+5. Only run on **configuration change** -- track a hash of `(proxy config + IdP URLs)` and skip if unchanged since last sync
+
+Return `error` (→ Degraded) only for proxy-level failures. Return `nil` for transient IdP failures (warning logged).
+
 ### starter.go
 
 Proxy config controller wiring updated to pass:
@@ -348,14 +386,18 @@ The helper encapsulates nil-safety, feature gate check, and lister access. Retur
 
 9. **Entrypoint injection guard:** `syncComponentProxyCA` verifies the `"exec oauth-server"` marker exists in the container entrypoint before attempting string replacement. Returns an error instead of silently failing if the deployment template changes.
 
+10. **noProxy auto-population with static defaults only:** The component-scoped proxy bypasses the CNO's `proxy.status.noProxy` computation, so the operator appends static cluster-internal defaults (`.cluster.local`, `.svc`, `localhost`, `127.0.0.1`). Network CIDRs and the api-int hostname are omitted because auth components use DNS names (covered by `.svc`/`.cluster.local`) for all internal connections -- adding `Network`/`Infrastructure` listers to multiple controllers would add coupling with no practical benefit. The `mergeNoProxy()` function takes only the user-provided noProxy string and is called only in the component-proxy branch of `ResolveProxyConfig()`.
+
+11. **IdP validation severity:** IdP endpoint validation uses warning-level logging instead of returning errors (which would set Degraded). External IdPs can be transiently unreachable for reasons unrelated to proxy configuration. Proxy-level failures (connection refused to the proxy, TLS handshake errors with the proxy itself) still trigger Degraded. Validation runs only on config change (tracked by hash) to avoid hammering IdP endpoints every sync cycle.
+
 ---
 
 ## Files changed
 
 | File | Change |
 |---|---|
-| `pkg/controllers/common/proxy.go` | New: `GetComponentProxyConfig()`, `ResolveProxyConfig()` |
-| `pkg/controllers/common/proxy_test.go` | New: unit tests |
+| `pkg/controllers/common/proxy.go` | New: `GetComponentProxyConfig()`, `ResolveProxyConfig()`, `mergeNoProxy()` (static defaults only) |
+| `pkg/controllers/common/proxy_test.go` | New: unit tests, noProxy merge tests |
 | `pkg/controllers/deployment/deployment_controller.go` | New fields, proxy resolution, CA sync (to operand NS only), upgradeable condition, entrypoint guard |
 | `pkg/controllers/deployment/default_deployment.go` | Changed signature to accept resolved proxy strings |
 | `pkg/transport/transport.go` | New: `loadCAData()` helper, `CARefTransportFunc` type, `TransportForCARefWithProxy()` (dedicated transport, no DefaultTransport mutation), renamed `net` → `knet` |
@@ -364,7 +406,7 @@ The helper encapsulates nil-safety, feature gate check, and lister access. Retur
 | `pkg/controllers/configobservation/oauth/observe_idps.go` | Build transport closure, proxy resolution, reads proxy CA from `openshift-config` directly |
 | `pkg/controllers/configobservation/interfaces.go` | Added `OperatorAuthLister`, `FeatureGateAccessor` fields |
 | `pkg/controllers/configobservation/configobservercontroller/observe_config_controller.go` | New params, operator auth informer registration |
-| `pkg/controllers/proxyconfig/proxyconfig_controller.go` | Component proxy validation, reads proxy CA from `openshift-config` directly |
+| `pkg/controllers/proxyconfig/proxyconfig_controller.go` | Component proxy validation, IdP endpoint validation (+ oauthLister), reads proxy CA from `openshift-config` directly |
 | `pkg/operator/starter.go` | Updated wiring for all modified controllers |
 
 ---
