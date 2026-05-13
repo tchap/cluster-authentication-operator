@@ -122,6 +122,15 @@ type AuthenticationProxyConfig struct {
 - Does not touch the cluster-wide proxy API (out of scope per OCPSTRAT-3174).
 - Feature-gated behind `FeatureGateAuthenticationComponentProxy` (TechPreviewNoUpgrade initially).
 
+**Precedent:** every `operator.openshift.io/v1` resource embeds the base `OperatorSpec` inline and extends it with component-specific fields. This is the standard pattern for operand-scoped configuration that doesn't belong in the cluster-wide `config.openshift.io` APIs. Examples:
+
+- [**Console**](https://github.com/openshift/api/blob/master/operator/v1/types_console.go#L36) -- embeds `OperatorSpec` and adds `customization`, `providers`, `route`, `plugins`, and `ingress` to control console operand behavior.
+- [**Network**](https://github.com/openshift/api/blob/master/operator/v1/types_network.go#L58) -- embeds `OperatorSpec` and adds `clusterNetwork`, `serviceNetwork`, `defaultNetwork`, and extensive CNI-specific configuration.
+- [**ClusterCSIDriver**](https://github.com/openshift/api/blob/master/operator/v1/types_csi_cluster_driver.go#L94) -- embeds `OperatorSpec` and adds `storageClassState`, `driverConfig`, and other CSI driver knobs.
+- [**MachineConfiguration**](https://github.com/openshift/api/blob/master/operator/v1/types_machineconfiguration.go#L40) -- embeds `StaticPodOperatorSpec` and adds `managedBootImages`, `nodeDisruptionPolicy`, and other machine config fields.
+
+The Authentication operator spec has been unusually bare (no additional fields beyond `OperatorSpec` until now), so this is a natural extension.
+
 ### Proxy resolution semantics
 
 The resolution function handles three states. A non-nil but empty `Proxy` struct means "explicitly no proxy for auth, even if the cluster has one" -- this prevents surprises when an admin sets `spec.proxy: {}`.
