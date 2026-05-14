@@ -26,7 +26,6 @@ import (
 	operatorv1 "github.com/openshift/api/operator/v1"
 	configinformer "github.com/openshift/client-go/config/informers/externalversions"
 	configv1listers "github.com/openshift/client-go/config/listers/config/v1"
-	applyoperatorv1 "github.com/openshift/client-go/operator/applyconfigurations/operator/v1"
 	operatorv1listers "github.com/openshift/client-go/operator/listers/operator/v1"
 	routeinformers "github.com/openshift/client-go/route/informers/externalversions"
 	routev1listers "github.com/openshift/client-go/route/listers/route/v1"
@@ -230,10 +229,6 @@ func (c *oauthServerDeploymentSyncer) Sync(ctx context.Context, syncContext fact
 
 	httpProxy, httpsProxy, noProxy := common.ResolveProxyConfig(authProxy, clusterProxy)
 
-	if err := c.setComponentProxyUpgradeableCondition(ctx, authProxy); err != nil {
-		errs = append(errs, fmt.Errorf("setting upgradeable condition: %v", err))
-	}
-
 	// resourceVersions serves to store versions of config resources so that we
 	// can redeploy our payload should either change. We only omit the operator
 	// config version, it would both cause redeploy loops (status updates cause
@@ -369,31 +364,9 @@ func setRollingUpdateParameters(controlPlaneCount int32, deployment *appsv1.Depl
 }
 
 const (
-	componentProxyUpgradeableCondition = "AuthenticationComponentProxyUpgradeable"
-	componentProxyCAConfigMapName      = "v4-0-config-system-auth-proxy-ca"
-	componentProxyCAMountPath          = "/var/config/system/configmaps/" + componentProxyCAConfigMapName
+	componentProxyCAConfigMapName = "v4-0-config-system-auth-proxy-ca"
+	componentProxyCAMountPath     = "/var/config/system/configmaps/" + componentProxyCAConfigMapName
 )
-
-func (c *oauthServerDeploymentSyncer) setComponentProxyUpgradeableCondition(
-	ctx context.Context,
-	authProxy *operatorv1.AuthenticationProxyConfig,
-) error {
-	if authProxy == nil {
-		return nil
-	}
-
-	cond := applyoperatorv1.OperatorCondition().
-		WithType(componentProxyUpgradeableCondition).
-		WithStatus(operatorv1.ConditionFalse).
-		WithReason("ComponentProxyConfigured").
-		WithMessage("component-scoped proxy is configured; upgrades are blocked while this TechPreview feature is in use")
-
-	return c.operatorClient.ApplyOperatorStatus(
-		ctx,
-		"OAuthServerDeployment",
-		applyoperatorv1.OperatorStatus().WithConditions(cond),
-	)
-}
 
 // syncComponentProxyCA copies the component-scoped proxy CA ConfigMap from
 // openshift-config to openshift-authentication and adds volume/mount + entrypoint

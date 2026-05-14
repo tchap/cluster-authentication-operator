@@ -332,25 +332,6 @@ informerFactories.operatorInformer.Operator().V1().Authentications().Informer(),
 
 ---
 
-## Step 6: Upgradeable condition (2f)
-
-**File:** `pkg/controllers/deployment/deployment_controller.go`
-
-Added in the deployment controller's `Sync()` right after proxy resolution. Uses `operatorClient.ApplyOperatorStatus()` with `applyoperatorv1.OperatorCondition()` -- same pattern as `UnsupportedConfigOverridesUpgradeable` in library-go.
-
-When `authProxy != nil` (feature gate enabled and spec.proxy is set):
-- Sets `AuthenticationComponentProxyUpgradeable=False`
-- Reason: `ComponentProxyConfigured`
-- Message: explains TechPreview restriction
-
-When `authProxy == nil` (gate disabled or proxy not set): no condition is set (no-op).
-
-The condition is only set, never cleared to True -- once spec.proxy is removed, the condition simply stops being refreshed and the status controller in library-go handles the rest (conditions without the `Upgradeable` type default to True).
-
-**Implementation detail:** Uses `applyoperatorv1 "github.com/openshift/client-go/operator/applyconfigurations/operator/v1"` for the apply configuration builder. The field name passed to `ApplyOperatorStatus()` is `"OAuthServerDeployment"` identifying this controller instance.
-
----
-
 ## Feature gate guard pattern
 
 All call sites use the `GetComponentProxyConfig` helper:
@@ -398,7 +379,7 @@ The helper encapsulates nil-safety, feature gate check, and lister access. Retur
 |---|---|
 | `pkg/controllers/common/proxy.go` | New: `GetComponentProxyConfig()`, `ResolveProxyConfig()`, `mergeNoProxy()` (static defaults only) |
 | `pkg/controllers/common/proxy_test.go` | New: unit tests, noProxy merge tests |
-| `pkg/controllers/deployment/deployment_controller.go` | New fields, proxy resolution, CA sync (to operand NS only), upgradeable condition, entrypoint guard |
+| `pkg/controllers/deployment/deployment_controller.go` | New fields, proxy resolution, CA sync (to operand NS only), entrypoint guard |
 | `pkg/controllers/deployment/default_deployment.go` | Changed signature to accept resolved proxy strings |
 | `pkg/transport/transport.go` | New: `loadCAData()` helper, `CARefTransportFunc` type, `TransportForCARefWithProxy()` (dedicated transport, no DefaultTransport mutation), renamed `net` → `knet` |
 | `pkg/controllers/configobservation/oauth/idp_conversions.go` | Accept `CARefTransportFunc`, removed `cmLister` from leaf functions |

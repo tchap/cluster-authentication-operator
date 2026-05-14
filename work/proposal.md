@@ -358,10 +358,6 @@ Extend to validate the component-scoped proxy:
 - Use a **warning condition** (not `Degraded`) for transient IdP unreachability
 - Report `Degraded` only for proxy-level failures (connection refused, TLS handshake errors with the proxy itself)
 
-#### 2f. Upgradeable condition
-
-Set `Upgradeable=False` on the ClusterOperator when `spec.proxy` is configured. Prevents accidental upgrades during TechPreview.
-
 ### Phase 3: Testing
 
 **Unit tests:**
@@ -398,7 +394,7 @@ spec:
 
 The referenced ConfigMap must exist in `openshift-config` with key `ca-bundle.crt`.
 
-**Status reporting:** `ProxyConfigControllerDegraded` when proxy is unreachable. `Upgradeable=False` during TechPreview. Resolved proxy config surfaced in operator status / deployment annotations for `oc adm inspect` / must-gather.
+**Status reporting:** `ProxyConfigControllerDegraded` when proxy is unreachable. Resolved proxy config surfaced in operator status / deployment annotations for `oc adm inspect` / must-gather.
 
 **Backward compatibility:** When `spec.proxy` is `nil`, behavior is identical to today.
 
@@ -438,7 +434,7 @@ Informed by code analysis and by precedent from existing enhancement proposals: 
 | Risk | Mitigation |
 |------|------------|
 | **Feature gate proliferation** -- adds to test matrix | Gate is orthogonal to External OIDC |
-| **Z-stream rollback strips `spec.proxy`** -- CRD pruning during TechPreview | Set `Upgradeable=False`. Document cluster-wide proxy fallback before rollback. Risk disappears at GA |
+| **Z-stream rollback strips `spec.proxy`** -- CRD pruning during TechPreview | The TechPreviewNoUpgrade feature gate set prevents upgrades. Document cluster-wide proxy fallback before rollback. Risk disappears at GA |
 | **Limited TechPreview CI** | Dedicated periodic job. Graduation bar: 5+ tests, 7+/week, 95%+ pass rate, 14+ days |
 | **Proxy credential leakage** | Same model as cluster-wide proxy (credentials in URL). Future: optional `proxyCredentials` SecretNameReference |
 | **Support scope creep** -- users may expect per-component proxy for other operators | Scope explicitly to authentication only. Single-component solution, not a framework |
