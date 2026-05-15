@@ -221,7 +221,6 @@ func (p *proxyConfigChecker) validateIdPConnectivity(ctx context.Context, httpPr
 	if hash == p.lastIdPValidationHash {
 		return
 	}
-	p.lastIdPValidationHash = hash
 
 	componentProxyCfg := httpproxy.Config{
 		HTTPProxy:  httpProxy,
@@ -240,10 +239,15 @@ func (p *proxyConfigChecker) validateIdPConnectivity(ctx context.Context, httpPr
 		Timeout: 10 * time.Second,
 	}
 
+	allReachable := true
 	for _, idpURL := range idpURLs {
 		if err := isEndpointReachable(ctx, idpURL, client); err != nil {
 			klog.Warningf("IdP endpoint %q is unreachable through component proxy: %v", idpURL, err)
+			allReachable = false
 		}
+	}
+	if allReachable {
+		p.lastIdPValidationHash = hash
 	}
 }
 
