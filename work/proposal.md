@@ -355,7 +355,7 @@ Extend to validate the component-scoped proxy:
 
 **IdP endpoint validation.** Following the [Global Cluster Egress Proxy](https://github.com/openshift/enhancements/blob/master/enhancements/proxy/global-cluster-egress-proxy.md) precedent of validating proxy connectivity before accepting configuration, the controller should test that configured IdP endpoints (extracted from `oauth.config.openshift.io/cluster`) are reachable through the component proxy. However, unlike the cluster-wide proxy's validation endpoints (which are cluster-controlled), external IdP endpoints can experience transient outages, rate-limiting, or geo-restrictions unrelated to proxy configuration. To avoid noisy false positives:
 - Validate IdP connectivity on **configuration change only** (not on every sync loop)
-- Use a **warning condition** (not `Degraded`) for transient IdP unreachability
+- **Emit an event** (not a condition) for transient IdP unreachability — visible via `oc get events` without polluting operator conditions
 - Report `Degraded` only for proxy-level failures (connection refused, TLS handshake errors with the proxy itself)
 
 ### Phase 3: Testing

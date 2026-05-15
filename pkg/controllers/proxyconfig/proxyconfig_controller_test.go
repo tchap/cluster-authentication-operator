@@ -7,9 +7,17 @@ import (
 	"net/url"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
+	"time"
 
+	configv1 "github.com/openshift/api/config/v1"
+	configv1listers "github.com/openshift/client-go/config/listers/config/v1"
+	"github.com/openshift/library-go/pkg/operator/events"
 	"golang.org/x/net/http/httpproxy"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/cache"
+	clocktesting "k8s.io/utils/clock/testing"
 )
 
 func Test_isProxyConfigured(t *testing.T) {
@@ -231,4 +239,115 @@ func (s *workingHTTPRoundTripper) RoundTrip(_ *http.Request) (*http.Response, er
 
 func (s *faultyHTTPRoundTripper) RoundTrip(_ *http.Request) (*http.Response, error) {
 	return &http.Response{StatusCode: 404}, nil
+}
+
+func Test_validateIdPConnectivity(t *testing.T) {
+	tests := []struct {
+		name           string
+		idps           []configv1.IdentityProvider
+		client         *http.Client
+		wantEvent      bool
+		wantEventParts []string
+	}{
+		{
+			name:   "When all IdP endpoints are reachable it should not emit an event",
+			client: &http.Client{Transport: &workingHTTPRoundTripper{}},
+			idps: []configv1.IdentityProvider{
+				{
+					Name: "reachable",
+					IdentityProviderConfig: configv1.IdentityProviderConfig{
+						Type: configv1.IdentityProviderTypeGitLab,
+						GitLab: &configv1.GitLabIdentityProvider{
+							URL: "https://gitlab.example.com",
+						},
+					},
+				},
+			},
+		},
+		{
+			name:   "When an IdP endpoint is unreachable it should emit a warning event",
+			client: &http.Client{Transport: &faultyHTTPRoundTripper{}},
+			idps: []configv1.IdentityProvider{
+				{
+					Name: "unreachable",
+					IdentityProviderConfig: configv1.IdentityProviderConfig{
+						Type: configv1.IdentityProviderTypeGitLab,
+						GitLab: &configv1.GitLabIdentityProvider{
+							URL: "https://gitlab.example.com",
+						},
+					},
+				},
+			},
+			wantEvent:      true,
+			wantEventParts: []string{"gitlab.example.com"},
+		},
+		{
+			name:   "When multiple IdP endpoints are unreachable it should emit a single event listing all",
+			client: &http.Client{Transport: &faultyHTTPRoundTripper{}},
+			idps: []configv1.IdentityProvider{
+				{
+					Name: "gitlab",
+					IdentityProviderConfig: configv1.IdentityProviderConfig{
+						Type: configv1.IdentityProviderTypeGitLab,
+						GitLab: &configv1.GitLabIdentityProvider{
+							URL: "https://gitlab.example.com",
+						},
+					},
+				},
+				{
+					Name: "oidc",
+					IdentityProviderConfig: configv1.IdentityProviderConfig{
+						Type: configv1.IdentityProviderTypeOpenID,
+						OpenID: &configv1.OpenIDIdentityProvider{
+							Issuer: "https://sso.example.com",
+						},
+					},
+				},
+			},
+			wantEvent:      true,
+			wantEventParts: []string{"gitlab.example.com", "sso.example.com"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+			if err := indexer.Add(&configv1.OAuth{
+				ObjectMeta: metav1.ObjectMeta{Name: "cluster"},
+				Spec: configv1.OAuthSpec{
+					IdentityProviders: tt.idps,
+				},
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			recorder := events.NewInMemoryRecorder(t.Name(), clocktesting.NewFakePassiveClock(time.Now()))
+			p := &proxyConfigChecker{
+				oauthLister: configv1listers.NewOAuthLister(indexer),
+			}
+
+			p.validateIdPConnectivity(context.Background(), recorder, tt.client, "", "", "")
+
+			recordedEvents := recorder.Events()
+			if tt.wantEvent && len(recordedEvents) == 0 {
+				t.Fatal("expected a warning event but none was recorded")
+			}
+			if !tt.wantEvent && len(recordedEvents) > 0 {
+				t.Fatalf("expected no events but got %d: %v", len(recordedEvents), recordedEvents)
+			}
+			if tt.wantEvent {
+				if len(recordedEvents) != 1 {
+					t.Fatalf("expected exactly 1 event but got %d", len(recordedEvents))
+				}
+				event := recordedEvents[0]
+				if event.Reason != "IdPEndpointUnreachable" {
+					t.Errorf("expected reason IdPEndpointUnreachable, got %q", event.Reason)
+				}
+				for _, part := range tt.wantEventParts {
+					if !strings.Contains(event.Message, part) {
+						t.Errorf("event message %q does not contain expected substring %q", event.Message, part)
+					}
+				}
+			}
+		})
+	}
 }

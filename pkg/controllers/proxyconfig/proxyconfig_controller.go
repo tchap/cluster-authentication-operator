@@ -99,7 +99,7 @@ func NewProxyConfigChecker(
 }
 
 // sync attempts to connect to route using configured proxy settings and reports any error.
-func (p *proxyConfigChecker) sync(ctx context.Context, _ factory.SyncContext) error {
+func (p *proxyConfigChecker) sync(ctx context.Context, syncCtx factory.SyncContext) error {
 	if oidcAvailable, err := p.authConfigChecker.OIDCAvailable(); err != nil {
 		return err
 	} else if oidcAvailable {
@@ -112,7 +112,7 @@ func (p *proxyConfigChecker) sync(ctx context.Context, _ factory.SyncContext) er
 		klog.Warningf("failed to get component proxy config, falling back to cluster-wide proxy: %v", proxyErr)
 	}
 	if authProxy != nil {
-		return p.validateComponentProxy(ctx, authProxy)
+		return p.validateComponentProxy(ctx, syncCtx.Recorder(), authProxy)
 	}
 
 	proxyConfig := httpproxy.FromEnvironment()
@@ -139,7 +139,7 @@ func (p *proxyConfigChecker) sync(ctx context.Context, _ factory.SyncContext) er
 	return checkProxyConfig(ctx, routeURL, proxyConfig.NoProxy, clientWithProxy, clientWithoutProxy)
 }
 
-func (p *proxyConfigChecker) validateComponentProxy(ctx context.Context, authProxy *operatorv1.AuthenticationProxyConfig) error {
+func (p *proxyConfigChecker) validateComponentProxy(ctx context.Context, recorder events.Recorder, authProxy *operatorv1.AuthenticationProxyConfig) error {
 	httpProxy, httpsProxy, noProxy := common.ResolveProxyConfig(authProxy, nil)
 	if len(httpProxy) == 0 && len(httpsProxy) == 0 {
 		klog.V(4).Info("Component proxy configured with empty values, skipping validation")
@@ -196,7 +196,7 @@ func (p *proxyConfigChecker) validateComponentProxy(ctx context.Context, authPro
 		return err
 	}
 
-	p.validateIdPConnectivity(ctx, httpProxy, httpsProxy, noProxy, caPool)
+	p.validateIdPConnectivity(ctx, recorder, clientWithProxy, httpProxy, httpsProxy, noProxy)
 
 	return nil
 }
@@ -205,7 +205,7 @@ func (p *proxyConfigChecker) validateComponentProxy(ctx context.Context, authPro
 // the component proxy. Only runs on config change (tracked by hash). Reports warnings
 // for transient IdP failures instead of returning errors (which would set Degraded),
 // since external IdPs can be unreachable for reasons unrelated to proxy configuration.
-func (p *proxyConfigChecker) validateIdPConnectivity(ctx context.Context, httpProxy, httpsProxy, noProxy string, caPool *x509.CertPool) {
+func (p *proxyConfigChecker) validateIdPConnectivity(ctx context.Context, recorder events.Recorder, client *http.Client, httpProxy, httpsProxy, noProxy string) {
 	oauthConfig, err := p.oauthLister.Get("cluster")
 	if err != nil {
 		klog.V(4).Infof("unable to get oauth config for IdP validation: %v", err)
@@ -222,31 +222,16 @@ func (p *proxyConfigChecker) validateIdPConnectivity(ctx context.Context, httpPr
 		return
 	}
 
-	componentProxyCfg := httpproxy.Config{
-		HTTPProxy:  httpProxy,
-		HTTPSProxy: httpsProxy,
-		NoProxy:    noProxy,
-	}
-	proxyFn := componentProxyCfg.ProxyFunc()
-
-	client := &http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{RootCAs: caPool},
-			Proxy: func(req *http.Request) (*url.URL, error) {
-				return proxyFn(req.URL)
-			},
-		},
-		Timeout: 10 * time.Second,
-	}
-
-	allReachable := true
+	var unreachable []string
 	for _, idpURL := range idpURLs {
 		if err := isEndpointReachable(ctx, idpURL, client); err != nil {
 			klog.Warningf("IdP endpoint %q is unreachable through component proxy: %v", idpURL, err)
-			allReachable = false
+			unreachable = append(unreachable, fmt.Sprintf("%s: %v", idpURL, err))
 		}
 	}
-	if allReachable {
+	if len(unreachable) > 0 {
+		recorder.Warningf("IdPEndpointUnreachable", "IdP endpoints unreachable through component proxy: %s", strings.Join(unreachable, "; "))
+	} else {
 		p.lastIdPValidationHash = hash
 	}
 }
