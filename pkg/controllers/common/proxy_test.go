@@ -6,6 +6,7 @@ import (
 
 	configv1 "github.com/openshift/api/config/v1"
 	operatorv1 "github.com/openshift/api/operator/v1"
+	"k8s.io/utils/ptr"
 )
 
 func TestResolveProxyConfig(t *testing.T) {
@@ -20,8 +21,8 @@ func TestResolveProxyConfig(t *testing.T) {
 		{
 			name: "component proxy with values overrides cluster proxy",
 			authProxy: &operatorv1.AuthenticationProxyConfig{
-				HTTPProxy:  "http://component:3128",
-				HTTPSProxy: "http://component:3129",
+				HTTPProxy:  ptr.To("http://component:3128"),
+				HTTPSProxy: ptr.To("http://component:3129"),
 				NoProxy:    ".local",
 			},
 			clusterProxy: &configv1.Proxy{
@@ -36,8 +37,11 @@ func TestResolveProxyConfig(t *testing.T) {
 			wantNoProxy:    ".cluster.local,.local,.svc,127.0.0.1,localhost",
 		},
 		{
-			name:      "empty component proxy means explicitly no proxy",
-			authProxy: &operatorv1.AuthenticationProxyConfig{},
+			name: "empty component proxy means explicitly no proxy",
+			authProxy: &operatorv1.AuthenticationProxyConfig{
+				HTTPProxy:  ptr.To(""),
+				HTTPSProxy: ptr.To(""),
+			},
 			clusterProxy: &configv1.Proxy{
 				Status: configv1.ProxyStatus{
 					HTTPProxy:  "http://cluster:3128",
@@ -84,7 +88,8 @@ func TestResolveProxyConfig(t *testing.T) {
 		{
 			name: "component proxy with partial values",
 			authProxy: &operatorv1.AuthenticationProxyConfig{
-				HTTPSProxy: "http://component:3129",
+				HTTPProxy:  ptr.To(""),
+				HTTPSProxy: ptr.To("http://component:3129"),
 			},
 			clusterProxy: &configv1.Proxy{
 				Status: configv1.ProxyStatus{

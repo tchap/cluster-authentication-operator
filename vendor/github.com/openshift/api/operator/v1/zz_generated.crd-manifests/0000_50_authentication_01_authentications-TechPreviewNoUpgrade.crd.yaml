@@ -100,19 +100,17 @@ spec:
                   httpProxy:
                     description: |-
                       httpProxy is the URL of the proxy for HTTP requests.
-                      When set, authentication components will use this proxy for all
+                      Authentication components will use this proxy for all
                       outbound HTTP connections to external identity providers.
-                      When omitted, no HTTP proxy is configured for authentication
-                      components (unless inherited from the cluster-wide proxy).
+                      An empty string means no HTTP proxy is used.
                     type: string
                   httpsProxy:
                     description: |-
                       httpsProxy is the URL of the proxy for HTTPS requests.
-                      When set, authentication components will use this proxy for all
+                      Authentication components will use this proxy for all
                       outbound HTTPS connections to external identity providers,
                       including OIDC discovery, token exchange, and user info requests.
-                      When omitted, no HTTPS proxy is configured for authentication
-                      components (unless inherited from the cluster-wide proxy).
+                      An empty string means no HTTPS proxy is used.
                     type: string
                   noProxy:
                     description: |-
@@ -139,6 +137,9 @@ spec:
                     required:
                     - name
                     type: object
+                required:
+                - httpProxy
+                - httpsProxy
                 type: object
               unsupportedConfigOverrides:
                 description: |-

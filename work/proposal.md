@@ -104,12 +104,14 @@ type AuthenticationSpec struct {
 // authentication components.
 type AuthenticationProxyConfig struct {
     // httpProxy is the URL of the proxy for HTTP requests.
-    // +optional
-    HTTPProxy string `json:"httpProxy,omitempty"`
+    // An empty string means no HTTP proxy is used.
+    // +required
+    HTTPProxy *string `json:"httpProxy"`
 
     // httpsProxy is the URL of the proxy for HTTPS requests.
-    // +optional
-    HTTPSProxy string `json:"httpsProxy,omitempty"`
+    // An empty string means no HTTPS proxy is used.
+    // +required
+    HTTPSProxy *string `json:"httpsProxy"`
 
     // noProxy is a comma-separated list of hostnames and/or CIDRs and/or IPs
     // for which the proxy should not be used.
@@ -143,10 +145,10 @@ The Authentication operator spec has been unusually bare (no additional fields b
 
 ### Proxy resolution semantics
 
-The resolution function handles three states. A non-nil but empty `Proxy` struct means "explicitly no proxy for auth, even if the cluster has one" -- this prevents surprises when an admin sets `spec.proxy: {}`.
+The resolution function handles three states. Since `httpProxy` and `httpsProxy` are required `*string` fields, a non-nil `Proxy` struct always has both fields present. Setting them to empty strings means "explicitly no proxy for auth, even if the cluster has one."
 
-1. `spec.proxy` set with values → use component-scoped proxy
-2. `spec.proxy` set but empty (`proxy: {}`) → explicitly no proxy
+1. `spec.proxy` set with non-empty values → use component-scoped proxy
+2. `spec.proxy` set with empty strings (`httpProxy: ""`, `httpsProxy: ""`) → explicitly no proxy
 3. `spec.proxy` absent (`nil`) → fall back to `proxy.config.openshift.io/cluster`
 4. Neither configured → no proxy
 

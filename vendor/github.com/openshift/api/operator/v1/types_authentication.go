@@ -54,21 +54,19 @@ type AuthenticationSpec struct {
 // +kubebuilder:validation:MinProperties=0
 type AuthenticationProxyConfig struct {
 	// httpProxy is the URL of the proxy for HTTP requests.
-	// When set, authentication components will use this proxy for all
+	// Authentication components will use this proxy for all
 	// outbound HTTP connections to external identity providers.
-	// When omitted, no HTTP proxy is configured for authentication
-	// components (unless inherited from the cluster-wide proxy).
-	// +optional
-	HTTPProxy string `json:"httpProxy,omitempty"`
+	// An empty string means no HTTP proxy is used.
+	// +required
+	HTTPProxy *string `json:"httpProxy"`
 
 	// httpsProxy is the URL of the proxy for HTTPS requests.
-	// When set, authentication components will use this proxy for all
+	// Authentication components will use this proxy for all
 	// outbound HTTPS connections to external identity providers,
 	// including OIDC discovery, token exchange, and user info requests.
-	// When omitted, no HTTPS proxy is configured for authentication
-	// components (unless inherited from the cluster-wide proxy).
-	// +optional
-	HTTPSProxy string `json:"httpsProxy,omitempty"`
+	// An empty string means no HTTPS proxy is used.
+	// +required
+	HTTPSProxy *string `json:"httpsProxy"`
 
 	// noProxy is a comma-separated list of hostnames and/or CIDRs and/or IPs
 	// for which the proxy should not be used.

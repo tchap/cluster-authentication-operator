@@ -11,6 +11,7 @@ import (
 	"github.com/openshift/library-go/pkg/operator/configobserver/featuregates"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/utils/ptr"
 )
 
 // GetComponentProxyConfig returns the component-scoped proxy configuration
@@ -56,7 +57,7 @@ func ResolveProxyConfig(
 	clusterProxy *configv1.Proxy,
 ) (httpProxy, httpsProxy, noProxy string) {
 	if authProxy != nil {
-		return authProxy.HTTPProxy, authProxy.HTTPSProxy,
+		return ptr.Deref(authProxy.HTTPProxy, ""), ptr.Deref(authProxy.HTTPSProxy, ""),
 			mergeNoProxy(authProxy.NoProxy)
 	}
 	if clusterProxy != nil {
