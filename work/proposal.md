@@ -66,13 +66,17 @@ Customers in restricted environments need auth components to reach external IdPs
 
 ### Current workarounds
 
-There is no mechanism between "no proxy" and "proxy for everything." Customers working around this today have three options, none of which are satisfactory:
+There is no mechanism between "no proxy" and "proxy for everything." Customers working around this today have several options, none of which are satisfactory:
 
-1. **Cluster-wide proxy + network policy** -- enable the cluster-wide proxy, then use `NetworkPolicy` or `EgressFirewall` (OVN-Kubernetes) to restrict which pods can reach the proxy endpoint. Only auth pods get network-level egress to the proxy; everything else is blocked. This works but is fragile -- every component is configured with proxy settings, and a separate mechanism prevents most of them from using it.
+1. **Cluster-wide proxy + restrictive proxy ACLs** -- configure the cluster-wide proxy but lock down the proxy server itself to only forward traffic to IdP domains. Every component receives the env vars and attempts to use the proxy, but only auth-related traffic is allowed through. This leaks intent and generates noise from failed proxy connections in non-auth components.
 
-2. **Cluster-wide proxy + restrictive proxy ACLs** -- configure the cluster-wide proxy but lock down the proxy server itself to only forward traffic to IdP domains. Every component receives the env vars and attempts to use the proxy, but only auth-related traffic is allowed through. This leaks intent and generates noise from failed proxy connections in non-auth components.
+2. **Cluster-wide proxy + network policy** -- enable the cluster-wide proxy, then use `NetworkPolicy` or `EgressFirewall` (OVN-Kubernetes) to restrict which pods can reach the proxy endpoint. Only auth pods get network-level egress to the proxy; everything else is blocked. This works but is fragile -- every component is configured with proxy settings, and a separate mechanism prevents most of them from using it.
 
-3. **Manual env var injection** -- skip the cluster-wide proxy API entirely and patch the OAuth Server and operator deployments directly with proxy env vars. This is unsupported, breaks on upgrades when the CVO reconciles the deployments, and doesn't survive operator-managed redeployments.
+3. **Internal IdP federation** -- deploy an internal identity provider (e.g., Keycloak) that federates to the external IdP, and only allow the internal IdP to reach the outside network. This adds significant operational overhead: a full identity service to deploy, maintain, and upgrade, with its own HA, certificates, and storage requirements. It also doubles auth latency.
+
+4. **Egress sidecar** -- inject a sidecar proxy (e.g., Envoy) into the OAuth Server pod to intercept outbound IdP traffic and forward it through a network path permitted to egress, avoiding proxy environment variables entirely. This requires deploying, configuring, and maintaining the sidecar (TLS origination, routing rules, health checks) and managing its lifecycle across upgrades. It also does not cover the operator's own outbound calls (OIDC discovery during config observation), which run in a separate pod -- requiring either a second sidecar or a cluster-level solution like a service mesh.
+
+5. **Manual env var injection** -- skip the cluster-wide proxy API entirely and patch the OAuth Server and operator deployments directly with proxy env vars. This is unsupported, breaks on upgrades when the CVO reconciles the deployments, and doesn't survive operator-managed redeployments.
 
 ### Identified gaps
 
@@ -177,14 +181,14 @@ All code paths guarded by `FeatureGateAuthenticationComponentProxy`.
 
 | Controller / Component | File(s) | Role | What changes |
 |---|---|---|---|
-| **Proxy resolution helper** | `pkg/controllers/common/proxy.go` (new) | Resolves effective proxy config: component-scoped > cluster-wide > none | New `ResolveProxyConfig()` function used by all other controllers |
-| **Deployment controller** | `pkg/controllers/deployment/deployment_controller.go`, `default_deployment.go` | Builds and reconciles the OAuth Server Deployment; injects `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` env vars into the pod spec | Call `ResolveProxyConfig()` instead of reading the cluster-wide proxy directly; include resolved proxy in deployment hash to trigger rollouts on change |
-| **Config observation (IDP conversions)** | `pkg/controllers/configobservation/oauth/idp_conversions.go` | Runs OIDC discovery (`discoverOpenIDURLs()`) to validate IdP endpoints during config observation | Use new `TransportForCARefWithProxy()` so discovery calls go through the component-scoped proxy |
-| **Transport layer** | `pkg/transport/transport.go` | Builds `http.RoundTripper` for outbound calls from the operator process | Add `TransportForCARefWithProxy()` variant that overrides the env-var-based proxy with a caller-supplied proxy URL |
-| **Proxy validation controller** | `pkg/controllers/proxyconfig/proxyconfig_controller.go` | Validates proxy connectivity by testing the OAuth route's `/healthz` endpoint | Also validate the component-scoped proxy; test IdP connectivity; load component `trustedCA`; warn on missing `noProxy` entries |
-| **Trust distribution controller** | `pkg/controllers/trustdistribution/trustdistribution_controller.go` | PEM read/filter/write for CA bundles distributed to operands | Under Option B (server-side merge): merge injected system trust with component-scoped proxy CA into a single ConfigMap. Under Option A: no changes (entrypoint handles merge) |
-| **Resource sync (starter wiring)** | `pkg/operator/starter.go` | Syncs ConfigMaps/Secrets from `openshift-config` into operand namespaces | Sync the component-scoped `trustedCA` ConfigMap into `openshift-authentication` and `openshift-authentication-operator` |
-| **OAuth Server deployment manifest** | `bindata/oauth-openshift/deployment.yaml` | Deployment template for the OAuth Server pods | Add volume/mount for component CA (Option A: also extend entrypoint); update hash annotations |
+| **Proxy resolution helper** | `pkg/controllers/common/proxy.go` (new) | Resolves effective proxy config: component-scoped > cluster-wide > none | New `GetComponentProxyConfig()` and `ResolveProxyConfig()` functions used by all other controllers |
+| **Deployment controller** | `pkg/controllers/deployment/deployment_controller.go`, `default_deployment.go` | Builds and reconciles the OAuth Server Deployment; injects `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` env vars into the pod spec | Call `ResolveProxyConfig()` instead of reading the cluster-wide proxy directly; sync component proxy CA ConfigMap; inject volume/mount + entrypoint append dynamically; include resolved proxy in deployment hash to trigger rollouts on change |
+| **Config observation (IDP conversions)** | `pkg/controllers/configobservation/oauth/idp_conversions.go`, `observe_idps.go` | Runs OIDC discovery (`discoverOpenIDURLs()`) to validate IdP endpoints during config observation | Accept `CARefTransportFunc` closure; use `TransportForCARefWithProxy()` so discovery calls go through the component-scoped proxy |
+| **Transport layer** | `pkg/transport/transport.go` | Builds `http.RoundTripper` for outbound calls from the operator process | Add `CARefTransportFunc` type, `loadCAData()` helper, `TransportForCARefWithProxy()` variant that overrides the env-var-based proxy with caller-supplied proxy values |
+| **Proxy validation controller** | `pkg/controllers/proxyconfig/proxyconfig_controller.go` | Validates proxy connectivity by testing the OAuth route's `/healthz` endpoint | Also validate the component-scoped proxy; test IdP connectivity on config change (warning events, not Degraded); load component `trustedCA` |
+| **Config observer controller** | `pkg/controllers/configobservation/configobservercontroller/observe_config_controller.go` | Wires config observer with informers and listers | Register operator auth informer and pass feature gate accessor |
+| **Listers interface** | `pkg/controllers/configobservation/interfaces.go` | Provides listers to config observers | Add `OperatorAuthLister` and `FeatureGateAccessor` fields |
+| **Starter wiring** | `pkg/operator/starter.go` | Wires controllers with informers and dependencies | Pass operator auth informer/lister, feature gate accessor, and source namespace informer to all modified controllers |
 
 #### Accessing `spec.proxy` from controllers
 
@@ -203,7 +207,7 @@ proxy := authOperator.Spec.Proxy
 
 Each controller needing proxy config must be wired with this lister in `starter.go`.
 
-#### 2a. Proxy resolution helper
+#### Proxy resolution helper
 
 New file: `pkg/controllers/common/proxy.go`
 
@@ -233,7 +237,7 @@ Auto-appended entries (deduplicated against user-provided values):
 
 The CNO's `MergeUserSystemNoProxy()` additionally appends service/pod/machine network CIDRs, the internal API hostname, and platform-specific metadata IPs. These are omitted here because auth components connect to internal services via DNS names (`kubernetes.default.svc`, etc.) which are already covered by `.svc` and `.cluster.local`. The OAuth Server's kube client uses in-cluster config, not raw CIDRs or the `api-int` hostname. Network CIDRs would require adding `Network` and `Infrastructure` informers/listers across multiple controllers for no practical benefit to auth workloads.
 
-#### 2b. Trusted CA bundle syncing
+#### Trusted CA bundle syncing
 
 **How the cluster-wide proxy CA works today:** The cluster-network-operator's CA bundle injector watches for ConfigMaps labeled `config.openshift.io/inject-trusted-cabundle: "true"` and populates their `ca-bundle.crt` key with system trust + cluster-wide proxy CA already merged. The OAuth Server (`bindata/oauth-openshift/deployment.yaml:62-64`) mounts this ConfigMap and the entrypoint copies the bundle to the system trust path:
 
@@ -243,61 +247,33 @@ cp -f .../ca-bundle.crt /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
 
 The component-scoped `trustedCA` ConfigMap is admin-provided and won't be processed by the CA bundle injector (no label), so the operator must handle merging.
 
-**When `spec.proxy.trustedCA` is set**, the component CA must be merged with the existing trust chain (system trust + cluster-wide proxy CA). Two approaches are under consideration:
+**When `spec.proxy.trustedCA` is set**, the component CA must be merged with the existing trust chain (system trust + cluster-wide proxy CA). The entrypoint append approach is used: sync the component CA ConfigMap as-is, mount it as an additional volume, and extend the container entrypoint to concatenate it after the existing system trust copy.
 
-**Option A: Entrypoint append.** Sync the component CA ConfigMap as-is, mount it as an additional volume, and extend the container entrypoint to concatenate it after the existing system trust copy:
+1. **Sync** the referenced ConfigMap from `openshift-config` to `openshift-authentication` via direct `resourceapply.ApplyConfigMap()` in the deployment controller's `Sync()`. The `resourceSyncController.SyncConfigMap()` cannot be used because it registers a fixed source→destination mapping at startup, but the source name (`spec.proxy.trustedCA.name`) is dynamic. The synced ConfigMap uses the `v4-0-config-system-auth-proxy-ca` name so `getConfigResourceVersions()` automatically picks it up for deployment hash tracking, triggering rollouts on CA changes.
 
-1. **Sync** the referenced ConfigMap from `openshift-config` to the operand namespace and operator namespace via the resource sync controller (same pattern as other config syncs in `starter.go`).
-
-2. **Mount** it as an additional volume in the OAuth Server deployment (e.g., at `/var/config/system/configmaps/auth-proxy-ca`).
+2. **Mount** it as an additional volume in the OAuth Server deployment (at `/var/config/system/configmaps/v4-0-config-system-auth-proxy-ca`), marked as optional.
 
 3. **Append to system trust** by extending the container entrypoint:
 
     ```bash
-    if [ -s /var/config/system/configmaps/auth-proxy-ca/ca-bundle.crt ]; then
-        cat /var/config/system/configmaps/auth-proxy-ca/ca-bundle.crt \
+    if [ -s /var/config/system/configmaps/v4-0-config-system-auth-proxy-ca/ca-bundle.crt ]; then
+        echo "Appending component proxy CA bundle"
+        cat /var/config/system/configmaps/v4-0-config-system-auth-proxy-ca/ca-bundle.crt \
             >> /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
     fi
     ```
 
-    This runs after the existing `cp -f` of the injected system trust bundle, so the result is system trust + cluster-wide proxy CA + component-scoped proxy CA.
+    This runs after the existing `cp -f` of the injected system trust bundle, so the result is system trust + cluster-wide proxy CA + component-scoped proxy CA. The volume, mount, and entrypoint injection are done dynamically in the deployment controller, not in the static YAML template (matching the pattern used for custom router certs).
 
-4. **CAO process**: load the component CA into the cert pool in `TransportForCARefWithProxy()` (Phase 2d) and in the proxy validation controller's `getCACerts()` (which already uses `AppendCertsFromPEM` to load from a configurable set of ConfigMaps).
+4. **CAO process**: load the component CA into the cert pool in `TransportForCARefWithProxy()` and in the proxy validation controller's `getCACerts()` (which already uses `AppendCertsFromPEM` to load from a configurable set of ConfigMaps). The config observer and proxy validation controller read the proxy CA directly from `openshift-config` via the existing cross-namespace `ConfigMapLister`, eliminating a second cross-namespace copy.
 
-5. **Deployment hash tracking**: include the component CA ConfigMap's ResourceVersion so changes trigger rollouts. The OAuth Server controller already watches all `v4-0-config-*` ConfigMaps by prefix (`deployment_controller.go:304`); add the component CA ConfigMap to that set.
+5. **Watch for changes**: CAO must watch the source ConfigMap in `openshift-config`, copy it into `openshift-authentication` on any change, and re-deploy OAuth Server so that the updated ConfigMap is picked up. The deployment controller registers the `openshift-config` ConfigMap informer (`kubeInformersForSourceNamespace.Core().V1().ConfigMaps().Informer()`) in its namespaced informers, so changes to the source CA ConfigMap trigger a controller re-sync, ConfigMap re-copy, and rollout via the `v4-0-config-` prefix hash tracking.
 
-Files to change: `starter.go` (resource sync), `bindata/oauth-openshift/deployment.yaml` (volume/mount + entrypoint), `deployment_controller.go` (hash tracking).
+6. **Cleanup**: when `spec.proxy.trustedCA` is removed, `syncComponentProxyCA()` deletes the stale `v4-0-config-system-auth-proxy-ca` ConfigMap from `openshift-authentication`.
 
-**Option B: Server-side merge.** The operator reads both the injected system trust ConfigMap and the component CA, concatenates the PEM content, and writes a pre-merged ConfigMap to the operand namespace. Pods get a single ConfigMap with everything already merged -- no entrypoint or volume mount changes.
+An alternative (server-side merge in the `trustdistribution` controller) was considered but rejected: it would add a new reconciliation loop with ordering constraints (merged ConfigMap must be ready before pod starts) and source-watching complexity, while the entrypoint approach is straightforward and extends an existing pattern.
 
-1. **Sync** the component CA ConfigMap from `openshift-config` to the operator namespace (for reading).
-
-2. **Merge controller**: extend the `trustdistribution` controller (which already does PEM read/filter/write in `trustdistribution_controller.go:97-105`) or create a new controller that:
-   - Reads the injected system trust ConfigMap (e.g., `v4-0-config-system-trusted-ca-bundle` in `openshift-authentication`)
-   - Reads the synced component CA ConfigMap
-   - Concatenates PEM bundles
-   - Writes the result to a new ConfigMap (e.g., `merged-trusted-ca-bundle`) in the operand namespace
-   - Must not write back to the injected ConfigMap -- the CA bundle injector would overwrite it
-
-3. **Update deployment volumes** to reference the merged ConfigMap instead of the injected one. No entrypoint changes needed -- the existing `cp -f` picks up the merged bundle.
-
-4. **CAO process**: same as Option A (load component CA in cert pools).
-
-5. **Watch both sources**: re-merge and trigger rollout when either the injected bundle or the component CA changes.
-
-Files to change: `starter.go` (resource sync + merge controller wiring), `trustdistribution_controller.go` or new controller (merge logic), `deployment.yaml` (volume source name only), `deployment_controller.go` (hash tracking for merged ConfigMap).
-
-**Tradeoffs:**
-
-| | Option A: Entrypoint append | Option B: Server-side merge |
-|---|---|---|
-| Entrypoint changes | Yes | No |
-| Deployment YAML changes | Add volume/mount + entrypoint | Change volume source name |
-| New controller code | No | Yes -- reconciliation loop |
-| Failure mode | Straightforward -- pod has both files or it doesn't | Must handle ordering: merged ConfigMap must be ready before pod starts; changes to either source must trigger re-merge then rollout |
-| Existing pattern in repo | Entrypoint `cp -f` already exists | `trustdistribution_controller.go` already does PEM processing |
-
-#### 2c. OAuth Server deployment injection
+#### OAuth Server deployment injection
 
 **`pkg/controllers/deployment/default_deployment.go`** -- change `getOAuthServerDeployment()` to accept resolved proxy strings instead of `*configv1.Proxy`:
 
@@ -316,35 +292,33 @@ The OAuth Server picks up env vars automatically via `knet.SetTransportDefaults(
 **`pkg/controllers/deployment/deployment_controller.go`** -- resolve proxy in `sync()` and include in the deployment hash to trigger redeployments:
 
 ```go
-httpProxy, httpsProxy, noProxy := common.ResolveProxyConfig(&authConfig.Spec, clusterProxy)
+httpProxy, httpsProxy, noProxy := common.ResolveProxyConfig(authProxy, clusterProxy)
 resourceVersions = append(resourceVersions,
-    "auth-proxy:"+httpProxy+":"+httpsProxy+":"+noProxy)
+    fmt.Sprintf("proxy:%s:%s:%s", httpProxy, httpsProxy, noProxy))
 ```
 
-#### 2d. Operator process proxy configuration
+#### Operator process proxy configuration
 
-The CAO makes outbound OIDC discovery calls in `discoverOpenIDURLs()` (`idp_conversions.go:315`) via `transport.TransportForCARef()`. This delegates to `net.SetTransportDefaults()`, which sets `Proxy = http.ProxyFromEnvironment` -- so it respects env vars from the cluster-wide proxy. To support component-scoped proxy, add a variant that **overrides** the env-var-based proxy:
+The CAO makes outbound OIDC discovery calls in `discoverOpenIDURLs()` (`idp_conversions.go`) via `transport.TransportForCARef()`. This delegates to `net.SetTransportDefaults()`, which sets `Proxy = http.ProxyFromEnvironment` -- so it respects env vars from the cluster-wide proxy. To support component-scoped proxy, a new `CARefTransportFunc` type and `TransportForCARefWithProxy()` variant are added:
 
 **`pkg/transport/transport.go`:**
 
 ```go
+type CARefTransportFunc func(caConfigMapName, key string) (http.RoundTripper, error)
+
 func TransportForCARefWithProxy(
     cmLister corelistersv1.ConfigMapLister,
     caConfigMapName, key string,
-    proxyURL *url.URL,
-) (http.RoundTripper, error) {
-    // ... build transport as before (net.SetTransportDefaults sets
-    // Proxy = http.ProxyFromEnvironment by default) ...
-    if proxyURL != nil {
-        transport.Proxy = http.ProxyURL(proxyURL)
-    }
-    return transport, nil
-}
+    httpProxy, httpsProxy, noProxy string,
+    extraCAData []byte,
+) (http.RoundTripper, error)
 ```
 
-**`pkg/controllers/configobservation/oauth/idp_conversions.go`** -- update `discoverOpenIDURLs()` to accept and use proxy configuration via the `AuthenticationLister`. If the component-scoped `trustedCA` is set, load that CA from the synced ConfigMap in `openshift-authentication-operator`.
+The function always creates a dedicated `*http.Transport` (never returns `http.DefaultTransport`), applies proxy via `httpproxy.Config.ProxyFunc()`, and sets `transport.Proxy = nil` when all proxy values are empty (explicit no-proxy). A shared `loadCAData()` helper avoids duplicating CA-loading logic with `TransportForCARef`.
 
-#### 2e. Proxy validation controller
+**`pkg/controllers/configobservation/oauth/idp_conversions.go`** -- instead of threading proxy params through the call chain, a `CARefTransportFunc` closure is built once in `ObserveIdentityProviders()` and passed down to `convertIdentityProviders()`, `discoverOpenIDURLs()`, and `checkOIDCPasswordGrantFlow()`. This allowed removing `cmLister` from leaf function signatures since it was only used for transport creation. If the component-scoped `trustedCA` is set, the CA is loaded directly from `openshift-config` via the existing `ConfigMapLister`.
+
+#### Proxy validation controller
 
 **`pkg/controllers/proxyconfig/proxyconfig_controller.go`**
 

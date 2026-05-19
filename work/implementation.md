@@ -69,7 +69,7 @@ Returns `(nil, nil)` when the gate is disabled, not yet observed, or the resourc
 
 ---
 
-## Step 2: OAuth Server deployment injection (2c)
+## Step 2: OAuth Server deployment injection
 
 **Files:**
 - `pkg/controllers/deployment/deployment_controller.go`
@@ -137,7 +137,7 @@ informerFactories.operatorInformer.Operator().V1().Authentications().Informer(),
 
 ---
 
-## Step 3: Trusted CA syncing and mounting (2b, Option A)
+## Step 3: Trusted CA syncing and mounting
 
 **Files:**
 - `pkg/controllers/deployment/deployment_controller.go` (CA ConfigMap copy + volume/mount + entrypoint)
@@ -158,6 +158,12 @@ No copy to `openshift-authentication-operator` -- the config observer and proxy 
 
 The ConfigMap in `openshift-authentication` uses the `v4-0-config-` prefix so `getConfigResourceVersions()` automatically picks it up for deployment hash tracking, triggering rollouts on CA changes.
 
+### trustedCA ConfigMap watching
+
+The EP requires: "CAO must watch the source ConfigMap in `openshift-config`, copy it into `openshift-authentication` on any change, and re-deploy OAuth Server so that the updated ConfigMap is picked up."
+
+This is fulfilled by registering `kubeInformersForSourceNamespace.Core().V1().ConfigMaps().Informer()` in the deployment controller's namespaced informers (line 162 of `deployment_controller.go`). Any change to ConfigMaps in `openshift-config` triggers a controller re-sync, which calls `syncComponentProxyCA()` to re-copy the source ConfigMap via `resourceapply.ApplyConfigMap()`. The re-copied ConfigMap gets a new ResourceVersion, which is picked up by `getConfigResourceVersions()` (via the `v4-0-config-` prefix), changing the deployment hash and triggering a rollout.
+
 Volume name and mount follow existing conventions:
 ```
 Name:  v4-0-config-system-auth-proxy-ca
@@ -177,7 +183,7 @@ This runs after the existing system trust copy, so the result is: system trust +
 
 ---
 
-## Step 4: Operator process proxy (2d)
+## Step 4: Operator process proxy
 
 **Files:**
 - `pkg/transport/transport.go`
@@ -215,8 +221,8 @@ t.Proxy = func(req *http.Request) (*url.URL, error) {
 Instead of threading 4 proxy params through the call chain, a single `transport.CARefTransportFunc` closure is passed. This captures the cmLister and any proxy settings, so leaf functions don't need to know about proxy at all.
 
 Changed signatures:
-- `convertIdentityProviders(cmLister, secretsLister, idps, buildTransport)` -- 1 new param
-- `convertProviderConfigToIDPData(cmLister, secretsLister, ..., buildTransport)` -- same
+- `convertIdentityProviders(secretsLister, idps, buildTransport)` -- `cmLister` removed, `buildTransport` added
+- `convertProviderConfigToIDPData(secretsLister, ..., buildTransport)` -- same
 - `discoverOpenIDURLs(issuer, key, ca, buildTransport)` -- `cmLister` removed (only used for transport)
 - `checkOIDCPasswordGrantFlow(secretsLister, ..., buildTransport)` -- `cmLister` removed (only used for transport)
 
@@ -278,7 +284,7 @@ Test call sites in `idp_conversions_test.go` build a `CARefTransportFunc` closur
 
 ---
 
-## Step 5: Proxy validation controller (2e)
+## Step 5: Proxy validation controller
 
 **File:** `pkg/controllers/proxyconfig/proxyconfig_controller.go`
 
