@@ -68,15 +68,6 @@ type AuthenticationProxyConfig struct {
 	// +required
 	HTTPSProxy *string `json:"httpsProxy"`
 
-	// noProxy is a comma-separated list of hostnames and/or CIDRs and/or IPs
-	// for which the proxy should not be used.
-	// When set, requests to matching destinations bypass the configured
-	// httpProxy and httpsProxy.
-	// When omitted, no proxy bypass rules are configured for authentication
-	// components (unless inherited from the cluster-wide proxy).
-	// +optional
-	NoProxy string `json:"noProxy,omitempty"`
-
 	// trustedCA is a reference to a ConfigMap in the openshift-config
 	// namespace containing a CA certificate bundle under the key
 	// "ca-bundle.crt". This CA bundle is appended to the system trust

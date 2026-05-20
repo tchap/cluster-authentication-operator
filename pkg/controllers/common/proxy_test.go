@@ -1,7 +1,6 @@
 package common
 
 import (
-	"strings"
 	"testing"
 
 	configv1 "github.com/openshift/api/config/v1"
@@ -23,7 +22,6 @@ func TestResolveProxyConfig(t *testing.T) {
 			authProxy: &operatorv1.AuthenticationProxyConfig{
 				HTTPProxy:  ptr.To("http://component:3128"),
 				HTTPSProxy: ptr.To("http://component:3129"),
-				NoProxy:    ".local",
 			},
 			clusterProxy: &configv1.Proxy{
 				Status: configv1.ProxyStatus{
@@ -34,7 +32,7 @@ func TestResolveProxyConfig(t *testing.T) {
 			},
 			wantHTTPProxy:  "http://component:3128",
 			wantHTTPSProxy: "http://component:3129",
-			wantNoProxy:    ".cluster.local,.local,.svc,127.0.0.1,localhost",
+			wantNoProxy:    staticNoProxy,
 		},
 		{
 			name: "empty component proxy means explicitly no proxy",
@@ -51,7 +49,7 @@ func TestResolveProxyConfig(t *testing.T) {
 			},
 			wantHTTPProxy:  "",
 			wantHTTPSProxy: "",
-			wantNoProxy:    ".cluster.local,.svc,127.0.0.1,localhost",
+			wantNoProxy:    staticNoProxy,
 		},
 		{
 			name:      "nil component proxy falls back to cluster proxy",
@@ -100,7 +98,7 @@ func TestResolveProxyConfig(t *testing.T) {
 			},
 			wantHTTPProxy:  "",
 			wantHTTPSProxy: "http://component:3129",
-			wantNoProxy:    ".cluster.local,.svc,127.0.0.1,localhost",
+			wantNoProxy:    staticNoProxy,
 		},
 	}
 
@@ -115,58 +113,6 @@ func TestResolveProxyConfig(t *testing.T) {
 			}
 			if noProxy != tt.wantNoProxy {
 				t.Errorf("noProxy = %q, want %q", noProxy, tt.wantNoProxy)
-			}
-		})
-	}
-}
-
-func TestMergeNoProxy(t *testing.T) {
-	tests := []struct {
-		name        string
-		userNoProxy string
-		want        string
-	}{
-		{
-			name:        "static defaults only",
-			userNoProxy: "",
-			want:        ".cluster.local,.svc,127.0.0.1,localhost",
-		},
-		{
-			name:        "user entries merged with defaults",
-			userNoProxy: ".corp.example.com,10.0.0.0/8",
-			want:        ".cluster.local,.corp.example.com,.svc,10.0.0.0/8,127.0.0.1,localhost",
-		},
-		{
-			name:        "whitespace in user entries is trimmed",
-			userNoProxy: " .corp.example.com , 10.0.0.0/8 ",
-			want:        ".cluster.local,.corp.example.com,.svc,10.0.0.0/8,127.0.0.1,localhost",
-		},
-		{
-			name:        "empty entries in user noProxy are skipped",
-			userNoProxy: ".corp.example.com,,,.other",
-			want:        ".cluster.local,.corp.example.com,.other,.svc,127.0.0.1,localhost",
-		},
-		{
-			name:        "user entries that overlap with defaults are deduplicated",
-			userNoProxy: ".cluster.local,localhost,.custom",
-			want:        ".cluster.local,.custom,.svc,127.0.0.1,localhost",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := mergeNoProxy(tt.userNoProxy)
-			if got != tt.want {
-				t.Errorf("mergeNoProxy() = %q, want %q", got, tt.want)
-			}
-
-			entries := strings.Split(got, ",")
-			seen := make(map[string]bool)
-			for _, e := range entries {
-				if seen[e] {
-					t.Errorf("duplicate entry in noProxy: %q", e)
-				}
-				seen[e] = true
 			}
 		})
 	}

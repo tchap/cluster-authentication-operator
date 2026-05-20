@@ -2,7 +2,7 @@
 
 ## Context
 
-OCPSTRAT-3174 requires authentication components (CAO, OAuth Server) to reach external IdPs through a proxy without configuring the cluster-wide proxy. Phase 1 (API) is vendored: `operatorv1.AuthenticationSpec.Proxy *AuthenticationProxyConfig` with fields `HTTPProxy`, `HTTPSProxy`, `NoProxy`, `TrustedCA`. Feature gate: `FeatureGateAuthenticationComponentProxy` (TechPreviewNoUpgrade).
+OCPSTRAT-3174 requires authentication components (CAO, OAuth Server) to reach external IdPs through a proxy without configuring the cluster-wide proxy. Phase 1 (API) is vendored: `operatorv1.AuthenticationSpec.Proxy *AuthenticationProxyConfig` with fields `HTTPProxy`, `HTTPSProxy`, `TrustedCA`. Feature gate: `FeatureGateAuthenticationComponentProxy` (TechPreviewNoUpgrade).
 
 **Resolution semantics:**
 1. `spec.proxy` with values -> component proxy
@@ -22,39 +22,26 @@ func ResolveProxyConfig(
     clusterProxy *configv1.Proxy,
 ) (httpProxy, httpsProxy, noProxy string) {
     if authProxy != nil {
-        return authProxy.HTTPProxy, authProxy.HTTPSProxy,
-               mergeNoProxy(authProxy.NoProxy)
+        return ptr.Deref(authProxy.HTTPProxy, ""),
+               ptr.Deref(authProxy.HTTPSProxy, ""),
+               staticNoProxy
     }
     if clusterProxy != nil {
         return clusterProxy.Status.HTTPProxy, clusterProxy.Status.HTTPSProxy, clusterProxy.Status.NoProxy
     }
     return "", "", ""
 }
+
+const staticNoProxy = ".cluster.local,.svc,127.0.0.1,localhost"
 ```
 
-Pure function, no feature gate logic -- callers decide whether to pass `authProxy` based on the gate. Signature unchanged from before -- no new parameters needed. Unit tests in `proxy_test.go` covering all 4 resolution states plus partial-values case.
+Pure function, no feature gate logic -- callers decide whether to pass `authProxy` based on the gate. Unit tests in `proxy_test.go` covering all 4 resolution states plus partial-values case.
 
-### noProxy auto-population
+### Static noProxy defaults
 
-Following the [Global Cluster Egress Proxy](https://github.com/openshift/enhancements/blob/master/enhancements/proxy/global-cluster-egress-proxy.md) precedent, the operator auto-appends cluster-internal addresses to the user-provided `noProxy` when component-scoped proxy is active. This prevents auth components from accidentally routing internal traffic through the proxy.
+When the component-scoped proxy is active, `NO_PROXY` is always set to static cluster-internal defaults (`.cluster.local`, `.svc`, `127.0.0.1`, `localhost`). There is no user-configurable `noProxy` field -- per-IdP proxy configuration is a non-goal.
 
-```go
-func mergeNoProxy(userNoProxy string) string
-```
-
-Auto-appended entries (deduplicated against user-provided values):
-- `.cluster.local`, `.svc`, `localhost`, `127.0.0.1`
-
-The CNO's `MergeUserSystemNoProxy()` (`cluster-network-operator/pkg/util/proxyconfig/no_proxy.go`) additionally appends service/pod/machine network CIDRs, the internal API hostname, and platform-specific metadata IPs. These are omitted because auth components connect to internal services via DNS names (`kubernetes.default.svc`, etc.) which are already covered by `.svc` and `.cluster.local`. The OAuth Server's kube client uses in-cluster config, not raw CIDRs or the `api-int` hostname. Adding `Network` and `Infrastructure` informers/listers across multiple controllers would add coupling with no practical benefit to auth workloads.
-
-`mergeNoProxy()` is only called in the component-proxy branch. The cluster-wide proxy branch returns `.status.noProxy` as-is -- those defaults are already computed by the CNO.
-
-### Tests
-
-Add new tests for noProxy auto-population:
-- Component proxy with user noProxy → user entries + static defaults merged
-- Component proxy with empty noProxy → only static defaults
-- Deduplication -- user entries that overlap with defaults are not repeated
+Auth components connect to internal services via DNS names covered by `.svc` and `.cluster.local`. Network CIDRs and the api-int hostname are not needed. The cluster-wide proxy branch returns `.status.noProxy` as-is -- those defaults are already computed by the CNO.
 
 Helper to get the proxy object with feature gate guarding:
 
@@ -453,7 +440,7 @@ The helper encapsulates nil-safety, feature gate check, and lister access. Retur
 
 9. **Entrypoint injection guard:** `syncComponentProxyCA` verifies the `"exec oauth-server"` marker exists in the container entrypoint before attempting string replacement. Returns an error instead of silently failing if the deployment template changes.
 
-10. **noProxy auto-population with static defaults only:** The component-scoped proxy bypasses the CNO's `proxy.status.noProxy` computation, so the operator appends static cluster-internal defaults (`.cluster.local`, `.svc`, `localhost`, `127.0.0.1`). Network CIDRs and the api-int hostname are omitted because auth components use DNS names (covered by `.svc`/`.cluster.local`) for all internal connections -- adding `Network`/`Infrastructure` listers to multiple controllers would add coupling with no practical benefit. The `mergeNoProxy()` function takes only the user-provided noProxy string and is called only in the component-proxy branch of `ResolveProxyConfig()`.
+10. **Static noProxy defaults:** The component-scoped proxy bypasses the CNO's `proxy.status.noProxy` computation. There is no user-configurable `noProxy` field -- the operator always sets `NO_PROXY` to static cluster-internal defaults (`.cluster.local`, `.svc`, `localhost`, `127.0.0.1`). Auth components use DNS names (covered by `.svc`/`.cluster.local`) for all internal connections.
 
 11. **IdP validation severity:** IdP endpoint validation uses warning-level logging instead of returning errors (which would set Degraded). External IdPs can be transiently unreachable for reasons unrelated to proxy configuration. Proxy-level failures (connection refused to the proxy, TLS handshake errors with the proxy itself) still trigger Degraded. Validation runs only on config change (tracked by hash) to avoid hammering IdP endpoints every sync cycle.
 
@@ -463,8 +450,8 @@ The helper encapsulates nil-safety, feature gate check, and lister access. Retur
 
 | File | Change |
 |---|---|
-| `pkg/controllers/common/proxy.go` | New: `GetComponentProxyConfig()`, `ResolveProxyConfig()`, `mergeNoProxy()` (static defaults only) |
-| `pkg/controllers/common/proxy_test.go` | New: unit tests, noProxy merge tests |
+| `pkg/controllers/common/proxy.go` | New: `GetComponentProxyConfig()`, `ResolveProxyConfig()`, `staticNoProxy` constant |
+| `pkg/controllers/common/proxy_test.go` | New: unit tests for resolution precedence |
 | `pkg/controllers/deployment/deployment_controller.go` | New fields, proxy resolution, CA sync (to operand NS only), entrypoint guard |
 | `pkg/controllers/deployment/default_deployment.go` | Changed signature to accept resolved proxy strings |
 | `pkg/transport/transport.go` | New: `loadCAData()` helper, `CARefTransportFunc` type, `TransportForCARefWithProxy()` (dedicated transport, no DefaultTransport mutation), renamed `net` → `knet` |

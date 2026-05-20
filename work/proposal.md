@@ -117,11 +117,6 @@ type AuthenticationProxyConfig struct {
     // +required
     HTTPSProxy *string `json:"httpsProxy"`
 
-    // noProxy is a comma-separated list of hostnames and/or CIDRs and/or IPs
-    // for which the proxy should not be used.
-    // +optional
-    NoProxy string `json:"noProxy,omitempty"`
-
     // trustedCA is a reference to a ConfigMap in the openshift-config
     // namespace containing a CA certificate bundle under the key
     // "ca-bundle.crt". This CA bundle is used for proxy TLS connections
@@ -171,7 +166,7 @@ The implementation spans two repositories (`openshift/api`, `cluster-authenticat
 - `operator/v1/types_authentication.go` -- add `Proxy *AuthenticationProxyConfig` field and type
 - `operator/v1/zz_generated.deepcopy.go`, `zz_generated.swagger_doc_generated.go` -- regenerate
 - `config/v1/feature_gates.go` -- add `FeatureGateAuthenticationComponentProxy` (TechPreviewNoUpgrade)
-- Add CRD validation markers for URL format, noProxy format
+- Add CRD validation markers for URL format
 
 ### Phase 2: Component-scoped proxy (cluster-authentication-operator)
 
@@ -214,13 +209,13 @@ New file: `pkg/controllers/common/proxy.go`
 
 ```go
 func ResolveProxyConfig(
-    authSpec *operatorv1.AuthenticationSpec,
+    authProxy *operatorv1.AuthenticationProxyConfig,
     clusterProxy *configv1.Proxy,
 ) (httpProxy, httpsProxy, noProxy string) {
-    if authSpec != nil && authSpec.Proxy != nil {
-        return authSpec.Proxy.HTTPProxy,
-               authSpec.Proxy.HTTPSProxy,
-               mergeNoProxy(authSpec.Proxy.NoProxy)
+    if authProxy != nil {
+        return ptr.Deref(authProxy.HTTPProxy, ""),
+               ptr.Deref(authProxy.HTTPSProxy, ""),
+               staticNoProxy
     }
     if clusterProxy != nil {
         return clusterProxy.Status.HTTPProxy,
@@ -229,14 +224,13 @@ func ResolveProxyConfig(
     }
     return "", "", ""
 }
+
+const staticNoProxy = ".cluster.local,.svc,127.0.0.1,localhost"
 ```
 
-**Auto-populated `noProxy` entries.** Following the precedent set by the [Global Cluster Egress Proxy](https://github.com/openshift/enhancements/blob/master/enhancements/proxy/global-cluster-egress-proxy.md), the operator auto-appends cluster-internal addresses to the user-provided `noProxy` value when `spec.proxy` is set. This prevents auth components from accidentally routing internal traffic through the proxy.
+**Static `noProxy` defaults.** When the component-scoped proxy is active, the operator always sets `NO_PROXY` to static cluster-internal defaults (`.cluster.local`, `.svc`, `127.0.0.1`, `localhost`). This prevents auth components from accidentally routing internal traffic through the proxy. The `noProxy` field is not user-configurable — per-IdP proxy configuration is a non-goal, and there is no practical use case for bypassing the proxy for some external IdPs but not others.
 
-Auto-appended entries (deduplicated against user-provided values):
-- `.cluster.local`, `.svc`, `localhost`, `127.0.0.1`
-
-The CNO's `MergeUserSystemNoProxy()` additionally appends service/pod/machine network CIDRs, the internal API hostname, and platform-specific metadata IPs. These are omitted here because auth components connect to internal services via DNS names (`kubernetes.default.svc`, etc.) which are already covered by `.svc` and `.cluster.local`. The OAuth Server's kube client uses in-cluster config, not raw CIDRs or the `api-int` hostname. Network CIDRs would require adding `Network` and `Infrastructure` informers/listers across multiple controllers for no practical benefit to auth workloads.
+Auth components connect to internal services via DNS names (`kubernetes.default.svc`, etc.) which are covered by `.svc` and `.cluster.local`. Network CIDRs and the api-int hostname are not needed.
 
 #### Trusted CA bundle syncing
 
@@ -364,7 +358,6 @@ spec:
   proxy:
     httpProxy: "http://proxy.corp.example.com:3128"
     httpsProxy: "http://proxy.corp.example.com:3128"
-    noProxy: ".cluster.local,.svc,10.0.0.0/8,172.16.0.0/12"
     trustedCA:
       name: "auth-proxy-ca-bundle"
 ```
@@ -403,7 +396,6 @@ Informed by code analysis and by precedent from existing enhancement proposals: 
 | **Proxy as untrusted intermediary** -- could intercept auth codes, tokens, user info | Document trust model. `trustedCA` pins proxy TLS certificate. Same model as cluster-wide proxy |
 | **Network dependency in auth path** -- proxy failure blocks all authentication | Same class of failure as cluster-wide proxy. Document HA requirement. Set `Degraded` when unreachable |
 | **Debugging complexity** -- component proxy differs from cluster proxy | Surface resolved config in operator status and deployment annotations. Document precedence |
-| **noProxy conflicts** -- users must reconcile component and cluster settings | Validate essential cluster-internal CIDRs. Warn via status condition |
 | **SNO disruption** -- only one OAuth server instance | Same as any OAuth config change on SNO. Document brief auth outage during rollout |
 
 ### Lifecycle risks

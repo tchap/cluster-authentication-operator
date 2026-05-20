@@ -112,15 +112,6 @@ spec:
                       including OIDC discovery, token exchange, and user info requests.
                       An empty string means no HTTPS proxy is used.
                     type: string
-                  noProxy:
-                    description: |-
-                      noProxy is a comma-separated list of hostnames and/or CIDRs and/or IPs
-                      for which the proxy should not be used.
-                      When set, requests to matching destinations bypass the configured
-                      httpProxy and httpsProxy.
-                      When omitted, no proxy bypass rules are configured for authentication
-                      components (unless inherited from the cluster-wide proxy).
-                    type: string
                   trustedCA:
                     description: |-
                       trustedCA is a reference to a ConfigMap in the openshift-config

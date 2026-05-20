@@ -131,7 +131,6 @@ var map_AuthenticationProxyConfig = map[string]string{
 	"":           "AuthenticationProxyConfig holds proxy configuration scoped to authentication components (the OAuth server and the cluster authentication operator).",
 	"httpProxy":  "httpProxy is the URL of the proxy for HTTP requests. Authentication components will use this proxy for all outbound HTTP connections to external identity providers. An empty string means no HTTP proxy is used.",
 	"httpsProxy": "httpsProxy is the URL of the proxy for HTTPS requests. Authentication components will use this proxy for all outbound HTTPS connections to external identity providers, including OIDC discovery, token exchange, and user info requests. An empty string means no HTTPS proxy is used.",
-	"noProxy":    "noProxy is a comma-separated list of hostnames and/or CIDRs and/or IPs for which the proxy should not be used. When set, requests to matching destinations bypass the configured httpProxy and httpsProxy. When omitted, no proxy bypass rules are configured for authentication components (unless inherited from the cluster-wide proxy).",
 	"trustedCA":  "trustedCA is a reference to a ConfigMap in the openshift-config namespace containing a CA certificate bundle under the key \"ca-bundle.crt\". This CA bundle is appended to the system trust store and used for proxy TLS connections by authentication components. When omitted, only the system trust store (including any cluster-wide proxy CA) is used.",
 }
 
