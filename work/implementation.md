@@ -2,13 +2,12 @@
 
 ## Context
 
-OCPSTRAT-3174 requires authentication components (CAO, OAuth Server) to reach external IdPs through a proxy without configuring the cluster-wide proxy. Phase 1 (API) is vendored: `operatorv1.AuthenticationSpec.Proxy *AuthenticationProxyConfig` with fields `HTTPProxy`, `HTTPSProxy`, `TrustedCA`. Feature gate: `FeatureGateAuthenticationComponentProxy` (TechPreviewNoUpgrade).
+OCPSTRAT-3174 requires authentication components (CAO, OAuth Server) to reach external IdPs through a proxy without configuring the cluster-wide proxy. Phase 1 (API) is vendored: `operatorv1.AuthenticationSpec.Proxy AuthenticationProxyConfig` (non-pointer, `omitzero`) with fields `HTTPProxy string`, `HTTPSProxy string`, `TrustedCA AuthenticationConfigMapReference`. CEL validation enforces at least one of `httpProxy`/`httpsProxy` is set. Feature gate: `FeatureGateAuthenticationComponentProxy` (TechPreviewNoUpgrade).
 
 **Resolution semantics:**
-1. `spec.proxy` with values -> component proxy
-2. `spec.proxy: {}` (empty) -> explicitly no proxy  
-3. `spec.proxy` absent (nil) -> cluster-wide proxy fallback
-4. Neither -> no proxy
+1. `spec.proxy` set with values -> component proxy (overrides cluster-wide)
+2. `spec.proxy` absent (zero value) -> cluster-wide proxy fallback
+3. Neither configured -> no proxy
 
 ---
 
@@ -21,10 +20,8 @@ func ResolveProxyConfig(
     authProxy *operatorv1.AuthenticationProxyConfig,
     clusterProxy *configv1.Proxy,
 ) (httpProxy, httpsProxy, noProxy string) {
-    if authProxy != nil {
-        return ptr.Deref(authProxy.HTTPProxy, ""),
-               ptr.Deref(authProxy.HTTPSProxy, ""),
-               staticNoProxy
+    if authProxy != nil && (authProxy.HTTPProxy != "" || authProxy.HTTPSProxy != "") {
+        return authProxy.HTTPProxy, authProxy.HTTPSProxy, staticNoProxy
     }
     if clusterProxy != nil {
         return clusterProxy.Status.HTTPProxy, clusterProxy.Status.HTTPSProxy, clusterProxy.Status.NoProxy
@@ -35,7 +32,7 @@ func ResolveProxyConfig(
 const staticNoProxy = ".cluster.local,.svc,127.0.0.1,localhost"
 ```
 
-Pure function, no feature gate logic -- callers decide whether to pass `authProxy` based on the gate. Unit tests in `proxy_test.go` covering all 4 resolution states plus partial-values case.
+Pure function, no feature gate logic -- callers decide whether to pass `authProxy` based on the gate. Fields are accessed directly as strings (no `ptr.Deref`). The URL-presence guard ensures a proxy struct with only `trustedCA` set falls through to the cluster-wide proxy. Unit tests in `proxy_test.go` covering resolution states plus partial-values case.
 
 ### Static noProxy defaults
 
@@ -52,7 +49,7 @@ func GetComponentProxyConfig(
 ) (*operatorv1.AuthenticationProxyConfig, error)
 ```
 
-Returns `(nil, nil)` when the gate is disabled, not yet observed, or the resource is not found. Returns a non-nil error only when the lister fails unexpectedly -- callers log the error and fall back to cluster-wide proxy.
+Returns `(nil, nil)` when the gate is disabled, not yet observed, or the resource is not found. Internally checks for the zero-value struct (since the API field is a non-pointer `AuthenticationProxyConfig` with `omitzero`) and returns nil when not configured. Returns a non-nil error only when the lister fails unexpectedly -- callers log the error and fall back to cluster-wide proxy.
 
 ---
 
@@ -294,7 +291,7 @@ In `sync()`, component proxy check runs first (before the existing cluster-wide 
 
 New method `validateComponentProxy()`:
 - Resolves proxy via `common.ResolveProxyConfig(authProxy, nil)`
-- If all values are empty (explicit no-proxy), logs and returns nil
+- If both proxy URLs are empty (should not happen with CEL validation, but defensive), logs and returns nil
 - Loads CA pool from existing `caConfigMaps` + component proxy CA from `openshift-config` by name (`authProxy.TrustedCA.Name`)
 - Builds proxy-aware and proxy-less HTTP clients
 - Calls existing `checkProxyConfig()` to test OAuth route reachability
@@ -416,7 +413,7 @@ if err != nil {
 }
 ```
 
-The helper encapsulates nil-safety, feature gate check, and lister access. Returns `(nil, nil)` when the gate is disabled, not observed, or the resource is not found. Returns a non-nil error only on unexpected lister failures -- callers log and fall back. When `authProxy` is nil, `ResolveProxyConfig(nil, clusterProxy)` returns cluster-wide proxy values -- identical to today.
+The helper encapsulates nil-safety, feature gate check, lister access, and zero-value detection. Returns `(nil, nil)` when the gate is disabled, not observed, the resource is not found, or the proxy struct is zero-valued. Returns a non-nil error only on unexpected lister failures -- callers log and fall back. When `authProxy` is nil, `ResolveProxyConfig(nil, clusterProxy)` returns cluster-wide proxy values -- identical to today.
 
 ---
 
@@ -438,6 +435,8 @@ The helper encapsulates nil-safety, feature gate check, and lister access. Retur
 
 8. **Dedicated transport in `TransportForCARefWithProxy`:** Unlike `transportForInner()` which may return `http.DefaultTransport`, the proxy-aware path always creates a fresh `*http.Transport`. This prevents accidental mutation of the process-wide `http.DefaultTransport.Proxy` when proxy settings are applied with no CA data.
 
+    **API field types:** The API uses non-pointer `string` fields with `omitempty` and `MinLength=1` (aligned with `config.openshift.io/v1 Proxy`). The `Proxy` struct uses `omitzero` instead of a pointer. `GetComponentProxyConfig` returns a `*AuthenticationProxyConfig` (nil = not configured) by checking for the zero-value struct internally. `ResolveProxyConfig` accesses fields directly as strings — no `ptr.Deref`. A CEL validation rule (`has(self.httpProxy) || has(self.httpsProxy)`) enforces that at least one proxy URL is set at the CRD level, and a URL-presence guard in `ResolveProxyConfig` provides defense-in-depth. `ConfigMapNameReference` is replaced by a local `AuthenticationConfigMapReference` type with `MinLength`/`MaxLength` name validations.
+
 9. **Entrypoint injection guard:** `syncComponentProxyCA` verifies the `"exec oauth-server"` marker exists in the container entrypoint before attempting string replacement. Returns an error instead of silently failing if the deployment template changes.
 
 10. **Static noProxy defaults:** The component-scoped proxy bypasses the CNO's `proxy.status.noProxy` computation. There is no user-configurable `noProxy` field -- the operator always sets `NO_PROXY` to static cluster-internal defaults (`.cluster.local`, `.svc`, `localhost`, `127.0.0.1`). Auth components use DNS names (covered by `.svc`/`.cluster.local`) for all internal connections.
@@ -450,8 +449,8 @@ The helper encapsulates nil-safety, feature gate check, and lister access. Retur
 
 | File | Change |
 |---|---|
-| `pkg/controllers/common/proxy.go` | New: `GetComponentProxyConfig()`, `ResolveProxyConfig()`, `staticNoProxy` constant |
-| `pkg/controllers/common/proxy_test.go` | New: unit tests for resolution precedence |
+| `pkg/controllers/common/proxy.go` | New: `GetComponentProxyConfig()` (zero-value detection for non-pointer API field), `ResolveProxyConfig()` (direct string access, URL-presence guard), `staticNoProxy` constant |
+| `pkg/controllers/common/proxy_test.go` | New: unit tests for resolution precedence (no `ptr.To`, plain strings) |
 | `pkg/controllers/deployment/deployment_controller.go` | New fields, proxy resolution, CA sync (to operand NS only), entrypoint guard |
 | `pkg/controllers/deployment/default_deployment.go` | Changed signature to accept resolved proxy strings |
 | `pkg/transport/transport.go` | New: `loadCAData()` helper, `CARefTransportFunc` type, `TransportForCARefWithProxy()` (dedicated transport, no DefaultTransport mutation), renamed `net` → `knet` |

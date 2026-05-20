@@ -96,40 +96,60 @@ type AuthenticationSpec struct {
     OperatorSpec `json:",inline"`
 
     // proxy configures proxy settings specifically for authentication
-    // components (OAuth server and the operator itself).
-    // When set, these values override the cluster-wide proxy for
-    // authentication operands. When unset, the cluster-wide proxy (if any)
-    // is used as today.
+    // components (the OAuth server and the operator itself).
+    // When set, these values override the cluster-wide proxy
+    // (proxy.config.openshift.io/cluster) for authentication operands only.
+    // No per-field inheritance from the cluster-wide proxy occurs.
+    // When omitted, the cluster-wide proxy is used, preserving
+    // existing behavior.
+    // +openshift:enable:FeatureGate=AuthenticationComponentProxy
     // +optional
-    Proxy *AuthenticationProxyConfig `json:"proxy,omitempty"`
+    Proxy AuthenticationProxyConfig `json:"proxy,omitzero"`
 }
 
 // AuthenticationProxyConfig holds proxy configuration scoped to
-// authentication components.
+// authentication components (the OAuth server and the cluster
+// authentication operator).
+// +kubebuilder:validation:XValidation:rule="has(self.httpProxy) || has(self.httpsProxy)",message="at least one of httpProxy or httpsProxy must be specified"
 type AuthenticationProxyConfig struct {
     // httpProxy is the URL of the proxy for HTTP requests.
-    // An empty string means no HTTP proxy is used.
-    // +required
-    HTTPProxy *string `json:"httpProxy"`
+    // +kubebuilder:validation:MinLength=1
+    // +optional
+    HTTPProxy string `json:"httpProxy,omitempty"`
 
     // httpsProxy is the URL of the proxy for HTTPS requests.
-    // An empty string means no HTTPS proxy is used.
-    // +required
-    HTTPSProxy *string `json:"httpsProxy"`
+    // +kubebuilder:validation:MinLength=1
+    // +optional
+    HTTPSProxy string `json:"httpsProxy,omitempty"`
 
     // trustedCA is a reference to a ConfigMap in the openshift-config
     // namespace containing a CA certificate bundle under the key
-    // "ca-bundle.crt". This CA bundle is used for proxy TLS connections
-    // by authentication components.
+    // "ca-bundle.crt". This CA bundle is appended to the system trust
+    // store and used for proxy TLS connections by authentication components.
+    // When omitted, only the system trust store (including any cluster-wide
+    // proxy CA) is used.
     // +optional
-    TrustedCA configv1.ConfigMapNameReference `json:"trustedCA,omitempty"`
+    TrustedCA AuthenticationConfigMapReference `json:"trustedCA,omitzero"`
+}
+
+// AuthenticationConfigMapReference references a ConfigMap in the
+// openshift-config namespace.
+type AuthenticationConfigMapReference struct {
+    // name is the metadata.name of the referenced ConfigMap.
+    // +kubebuilder:validation:MinLength=1
+    // +kubebuilder:validation:MaxLength=253
+    // +required
+    Name string `json:"name"`
 }
 ```
 
 **Why this approach:**
 - `operator.openshift.io/v1/authentications` is the standard place for operator-specific knobs.
-- Mirrors `config.openshift.io/v1 Proxy` for familiarity.
-- Fully optional -- `nil` means unchanged behavior.
+- Field types align with `config.openshift.io/v1 Proxy` (plain `string`, not `*string`).
+- `omitzero` on the `Proxy` struct avoids pointer indirection; the zero value is not a valid configuration.
+- `httpProxy` and `httpsProxy` are optional individually but a CEL rule enforces that at least one is set when the proxy object is present.
+- `MinLength=1` prevents empty strings — CRD-level validation gives immediate feedback on `oc apply`.
+- `AuthenticationConfigMapReference` is a local type with name format validations (`MinLength`, `MaxLength`), replacing the deprecated `configv1.ConfigMapNameReference`.
 - Does not touch the cluster-wide proxy API (out of scope per OCPSTRAT-3174).
 - Feature-gated behind `FeatureGateAuthenticationComponentProxy` (TechPreviewNoUpgrade initially).
 
@@ -144,12 +164,12 @@ The Authentication operator spec has been unusually bare (no additional fields b
 
 ### Proxy resolution semantics
 
-The resolution function handles three states. Since `httpProxy` and `httpsProxy` are required `*string` fields, a non-nil `Proxy` struct always has both fields present. Setting them to empty strings means "explicitly no proxy for auth, even if the cluster has one."
+Resolution follows two states:
 
-1. `spec.proxy` set with non-empty values → use component-scoped proxy
-2. `spec.proxy` set with empty strings (`httpProxy: ""`, `httpsProxy: ""`) → explicitly no proxy
-3. `spec.proxy` absent (`nil`) → fall back to `proxy.config.openshift.io/cluster`
-4. Neither configured → no proxy
+1. `spec.proxy` set → use component-scoped proxy, overriding any cluster-wide proxy. CRD validation enforces at least one of `httpProxy`/`httpsProxy` is present and non-empty.
+2. `spec.proxy` absent → fall back to `proxy.config.openshift.io/cluster` as today.
+
+No per-field inheritance from the cluster-wide proxy occurs; component-scoped proxy is all-or-nothing. When neither `spec.proxy` nor a cluster-wide proxy is configured, no proxy is used.
 
 ### Rejected alternatives
 
@@ -212,10 +232,8 @@ func ResolveProxyConfig(
     authProxy *operatorv1.AuthenticationProxyConfig,
     clusterProxy *configv1.Proxy,
 ) (httpProxy, httpsProxy, noProxy string) {
-    if authProxy != nil {
-        return ptr.Deref(authProxy.HTTPProxy, ""),
-               ptr.Deref(authProxy.HTTPSProxy, ""),
-               staticNoProxy
+    if authProxy != nil && (authProxy.HTTPProxy != "" || authProxy.HTTPSProxy != "") {
+        return authProxy.HTTPProxy, authProxy.HTTPSProxy, staticNoProxy
     }
     if clusterProxy != nil {
         return clusterProxy.Status.HTTPProxy,
@@ -227,6 +245,8 @@ func ResolveProxyConfig(
 
 const staticNoProxy = ".cluster.local,.svc,127.0.0.1,localhost"
 ```
+
+`GetComponentProxyConfig` returns a pointer (nil = not configured) even though the API field is a non-pointer struct; internally it checks for the zero value. Fields are accessed directly as strings (no `ptr.Deref`).
 
 **Static `noProxy` defaults.** When the component-scoped proxy is active, the operator always sets `NO_PROXY` to static cluster-internal defaults (`.cluster.local`, `.svc`, `127.0.0.1`, `localhost`). This prevents auth components from accidentally routing internal traffic through the proxy. The `noProxy` field is not user-configurable — per-IdP proxy configuration is a non-goal, and there is no practical use case for bypassing the proxy for some external IdPs but not others.
 
@@ -332,7 +352,7 @@ Extend to validate the component-scoped proxy:
 ### Phase 3: Testing
 
 **Unit tests:**
-- `proxy_test.go` -- resolution precedence (component > cluster > none), explicit disable
+- `proxy_test.go` -- resolution precedence (component > cluster > none)
 - `default_deployment_test.go` -- env var injection with component proxy
 - `transport_test.go` -- proxy function override on transport
 
@@ -341,7 +361,6 @@ Extend to validate the component-scoped proxy:
 - Configure `Authentication.spec.proxy` → verify OAuth login succeeds via proxy
 - Verify non-auth components do NOT use the component proxy
 - Test fallback (remove component proxy → cluster-wide proxy used)
-- Test explicit disable (`proxy: {}` → no proxy even with cluster-wide)
 - Test error reporting (invalid proxy → degraded condition)
 
 **CI:** Dedicated periodic job on a TechPreview cluster. Graduation bar: 5+ tests, 7+/week, 95%+ pass rate for 14+ days.

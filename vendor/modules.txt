@@ -226,7 +226,7 @@ github.com/openshift-eng/openshift-tests-extension/pkg/ginkgo
 github.com/openshift-eng/openshift-tests-extension/pkg/junit
 github.com/openshift-eng/openshift-tests-extension/pkg/util/sets
 github.com/openshift-eng/openshift-tests-extension/pkg/version
-# github.com/openshift/api v0.0.0-20260317165824-54a3998d81eb => github.com/tchap/api v0.0.0-20260520112246-a1d786e5f037
+# github.com/openshift/api v0.0.0-20260317165824-54a3998d81eb => github.com/tchap/api v0.0.0-20260520160945-7db7bafd2888
 ## explicit; go 1.25.0
 github.com/openshift/api
 github.com/openshift/api/annotations
@@ -1645,4 +1645,4 @@ sigs.k8s.io/structured-merge-diff/v6/value
 ## explicit; go 1.22
 sigs.k8s.io/yaml
 # github.com/onsi/ginkgo/v2 => github.com/openshift/onsi-ginkgo/v2 v2.6.1-0.20251001123353-fd5b1fb35db1
-# github.com/openshift/api => github.com/tchap/api v0.0.0-20260520112246-a1d786e5f037
+# github.com/openshift/api => github.com/tchap/api v0.0.0-20260520160945-7db7bafd2888

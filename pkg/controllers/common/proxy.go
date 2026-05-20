@@ -9,7 +9,6 @@ import (
 	operatorv1listers "github.com/openshift/client-go/operator/listers/operator/v1"
 	"github.com/openshift/library-go/pkg/operator/configobserver/featuregates"
 	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/utils/ptr"
 )
 
 // GetComponentProxyConfig returns the component-scoped proxy configuration
@@ -38,15 +37,18 @@ func GetComponentProxyConfig(
 	if err != nil {
 		return nil, fmt.Errorf("failed to get operator.openshift.io/v1 authentication/cluster: %v", err)
 	}
-	return authOp.Spec.Proxy, nil
+	proxy := authOp.Spec.Proxy
+	if (proxy == operatorv1.AuthenticationProxyConfig{}) {
+		return nil, nil
+	}
+	return &proxy, nil
 }
 
 // ResolveProxyConfig determines the effective proxy settings for authentication
-// components by applying three-way resolution:
-//  1. authProxy set with values -> use component-scoped proxy
-//  2. authProxy set but empty (proxy: {}) -> explicitly no proxy
-//  3. authProxy nil -> fall back to cluster-wide proxy
-//  4. Neither configured -> no proxy
+// components:
+//  1. authProxy set with at least one URL -> use component-scoped proxy
+//  2. authProxy nil or no URLs -> fall back to cluster-wide proxy
+//  3. Neither configured -> no proxy
 //
 // When using the component-scoped proxy, static cluster-internal noProxy defaults
 // are always set to prevent auth components from routing internal traffic through
@@ -55,9 +57,8 @@ func ResolveProxyConfig(
 	authProxy *operatorv1.AuthenticationProxyConfig,
 	clusterProxy *configv1.Proxy,
 ) (httpProxy, httpsProxy, noProxy string) {
-	if authProxy != nil {
-		return ptr.Deref(authProxy.HTTPProxy, ""), ptr.Deref(authProxy.HTTPSProxy, ""),
-			staticNoProxy
+	if authProxy != nil && (authProxy.HTTPProxy != "" || authProxy.HTTPSProxy != "") {
+		return authProxy.HTTPProxy, authProxy.HTTPSProxy, staticNoProxy
 	}
 	if clusterProxy != nil {
 		return clusterProxy.Status.HTTPProxy, clusterProxy.Status.HTTPSProxy, clusterProxy.Status.NoProxy

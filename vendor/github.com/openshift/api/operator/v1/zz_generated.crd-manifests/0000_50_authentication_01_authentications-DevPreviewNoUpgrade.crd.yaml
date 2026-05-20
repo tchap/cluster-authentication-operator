@@ -91,27 +91,31 @@ spec:
                   components (the OAuth server and the operator itself).
                   When set, these values override the cluster-wide proxy
                   (proxy.config.openshift.io/cluster) for authentication operands only.
-                  When set to an empty struct (proxy: {}), authentication components
-                  will not use any proxy, even if a cluster-wide proxy is configured.
-                  When omitted (nil), the cluster-wide proxy is used, preserving
+                  No per-field inheritance from the cluster-wide proxy occurs.
+                  When omitted, the cluster-wide proxy is used, preserving
                   existing behavior.
-                minProperties: 0
                 properties:
                   httpProxy:
                     description: |-
                       httpProxy is the URL of the proxy for HTTP requests.
                       Authentication components will use this proxy for all
                       outbound HTTP connections to external identity providers.
-                      An empty string means no HTTP proxy is used.
+                    minLength: 1
                     type: string
+                    x-kubernetes-validations:
+                    - message: httpProxy must be a valid URL
+                      rule: isURL(self)
                   httpsProxy:
                     description: |-
                       httpsProxy is the URL of the proxy for HTTPS requests.
                       Authentication components will use this proxy for all
                       outbound HTTPS connections to external identity providers,
                       including OIDC discovery, token exchange, and user info requests.
-                      An empty string means no HTTPS proxy is used.
+                    minLength: 1
                     type: string
+                    x-kubernetes-validations:
+                    - message: httpsProxy must be a valid URL
+                      rule: isURL(self)
                   trustedCA:
                     description: |-
                       trustedCA is a reference to a ConfigMap in the openshift-config
@@ -122,16 +126,17 @@ spec:
                       proxy CA) is used.
                     properties:
                       name:
-                        description: name is the metadata.name of the referenced config
-                          map
+                        description: name is the metadata.name of the referenced ConfigMap.
+                        maxLength: 253
+                        minLength: 1
                         type: string
                     required:
                     - name
                     type: object
-                required:
-                - httpProxy
-                - httpsProxy
                 type: object
+                x-kubernetes-validations:
+                - message: at least one of httpProxy or httpsProxy must be specified
+                  rule: has(self.httpProxy) || has(self.httpsProxy)
               unsupportedConfigOverrides:
                 description: |-
                   unsupportedConfigOverrides overrides the final configuration that was computed by the operator.

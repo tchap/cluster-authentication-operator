@@ -118,6 +118,15 @@ func (Authentication) SwaggerDoc() map[string]string {
 	return map_Authentication
 }
 
+var map_AuthenticationConfigMapReference = map[string]string{
+	"":     "AuthenticationConfigMapReference references a ConfigMap in the openshift-config namespace.",
+	"name": "name is the metadata.name of the referenced ConfigMap.",
+}
+
+func (AuthenticationConfigMapReference) SwaggerDoc() map[string]string {
+	return map_AuthenticationConfigMapReference
+}
+
 var map_AuthenticationList = map[string]string{
 	"":         "AuthenticationList is a collection of items\n\nCompatibility level 1: Stable within a major release for a minimum of 12 months or 3 minor releases (whichever is longer).",
 	"metadata": "metadata is the standard list's metadata. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata",
@@ -129,8 +138,8 @@ func (AuthenticationList) SwaggerDoc() map[string]string {
 
 var map_AuthenticationProxyConfig = map[string]string{
 	"":           "AuthenticationProxyConfig holds proxy configuration scoped to authentication components (the OAuth server and the cluster authentication operator).",
-	"httpProxy":  "httpProxy is the URL of the proxy for HTTP requests. Authentication components will use this proxy for all outbound HTTP connections to external identity providers. An empty string means no HTTP proxy is used.",
-	"httpsProxy": "httpsProxy is the URL of the proxy for HTTPS requests. Authentication components will use this proxy for all outbound HTTPS connections to external identity providers, including OIDC discovery, token exchange, and user info requests. An empty string means no HTTPS proxy is used.",
+	"httpProxy":  "httpProxy is the URL of the proxy for HTTP requests. Authentication components will use this proxy for all outbound HTTP connections to external identity providers.",
+	"httpsProxy": "httpsProxy is the URL of the proxy for HTTPS requests. Authentication components will use this proxy for all outbound HTTPS connections to external identity providers, including OIDC discovery, token exchange, and user info requests.",
 	"trustedCA":  "trustedCA is a reference to a ConfigMap in the openshift-config namespace containing a CA certificate bundle under the key \"ca-bundle.crt\". This CA bundle is appended to the system trust store and used for proxy TLS connections by authentication components. When omitted, only the system trust store (including any cluster-wide proxy CA) is used.",
 }
 
@@ -139,7 +148,7 @@ func (AuthenticationProxyConfig) SwaggerDoc() map[string]string {
 }
 
 var map_AuthenticationSpec = map[string]string{
-	"proxy": "proxy configures proxy settings specifically for authentication components (the OAuth server and the operator itself). When set, these values override the cluster-wide proxy (proxy.config.openshift.io/cluster) for authentication operands only. When set to an empty struct (proxy: {}), authentication components will not use any proxy, even if a cluster-wide proxy is configured. When omitted (nil), the cluster-wide proxy is used, preserving existing behavior.",
+	"proxy": "proxy configures proxy settings specifically for authentication components (the OAuth server and the operator itself). When set, these values override the cluster-wide proxy (proxy.config.openshift.io/cluster) for authentication operands only. No per-field inheritance from the cluster-wide proxy occurs. When omitted, the cluster-wide proxy is used, preserving existing behavior.",
 }
 
 func (AuthenticationSpec) SwaggerDoc() map[string]string {
