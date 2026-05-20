@@ -312,6 +312,9 @@ func prepareOauthOperator(
 		informerFactories.operatorConfigInformer.Config().V1().Ingresses(),
 		authConfigChecker,
 		systemCABundle,
+		informerFactories.operatorInformer.Operator().V1().Authentications().Lister(),
+		featureGateAccessor,
+		informerFactories.operatorInformer.Operator().V1().Authentications().Informer(),
 		authOperatorInput.eventRecorder,
 	)
 

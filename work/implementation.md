@@ -338,6 +338,86 @@ informerFactories.operatorInformer.Operator().V1().Authentications().Informer(),
 
 ---
 
+## Step 6: Endpoint accessible controller
+
+**Files:**
+- `pkg/libs/endpointaccessible/endpoint_accessible_controller.go`
+- `pkg/controllers/oauthendpoints/oauth_endpoints_controller.go`
+- `pkg/operator/starter.go`
+
+### Background
+
+The `OAuthServerRoute` endpoint accessible controller checks whether the OAuth route is reachable by hitting `https://<route-hostname>/healthz`. In cloud environments, the route hostname resolves to an external load balancer IP. The operator pod's traffic goes out to the LB and back in to the router. In a disconnected environment with only a component-scoped proxy (no cluster-wide proxy), `http.ProxyFromEnvironment` finds no env vars and the check fails, falsely reporting `Available=False`.
+
+The service and endpoint checks (`OAuthServerService`, `OAuthServerServiceEndpoints`) are not affected — they hit ClusterIP and pod IPs, which are always directly reachable.
+
+### endpoint_accessible_controller.go
+
+Add an optional proxy function callback, following the existing `getTLSConfigFn` pattern:
+
+```go
+type EndpointProxyFunc func() func(*http.Request) (*url.URL, error)
+```
+
+Add field `getProxyFn EndpointProxyFunc` to `endpointAccessibleController`.
+
+New constructor `NewEndpointAccessibleControllerWithProxy()` that accepts the extra param. The existing `NewEndpointAccessibleController()` stays unchanged (backward compatible) and passes `nil`.
+
+In `buildTLSClient()`, replace the hardcoded `http.ProxyFromEnvironment`:
+```go
+proxyFn := http.ProxyFromEnvironment
+if c.getProxyFn != nil {
+    if fn := c.getProxyFn(); fn != nil {
+        proxyFn = fn
+    }
+}
+transport := &http.Transport{
+    Proxy: proxyFn,
+    ...
+}
+```
+
+### oauth_endpoints_controller.go
+
+Update `NewOAuthRouteCheckController` signature to accept:
+```go
+operatorAuthLister operatorv1listers.AuthenticationLister,
+featureGateAccessor featuregates.FeatureGateAccess,
+```
+
+Build `getProxyFn` closure that resolves the component proxy:
+```go
+getProxyFn := func() func(*http.Request) (*url.URL, error) {
+    authProxy, err := common.GetComponentProxyConfig(featureGateAccessor, operatorAuthLister)
+    if err != nil || authProxy == nil {
+        return nil // fall back to http.ProxyFromEnvironment
+    }
+    httpProxy, httpsProxy, noProxy := common.ResolveProxyConfig(authProxy, nil)
+    if httpProxy == "" && httpsProxy == "" {
+        return nil
+    }
+    proxyCfg := httpproxy.Config{HTTPProxy: httpProxy, HTTPSProxy: httpsProxy, NoProxy: noProxy}
+    proxyFunc := proxyCfg.ProxyFunc()
+    return func(req *http.Request) (*url.URL, error) {
+        return proxyFunc(req.URL)
+    }
+}
+```
+
+Call `NewEndpointAccessibleControllerWithProxy` instead of `NewEndpointAccessibleController`.
+
+### starter.go
+
+Update `NewOAuthRouteCheckController` call to pass:
+```go
+informerFactories.operatorInformer.Operator().V1().Authentications().Lister(),
+featureGateAccessor,
+```
+
+Also add the operator auth informer to the triggers list so proxy config changes trigger a re-check.
+
+---
+
 ## Feature gate guard pattern
 
 All call sites use the `GetComponentProxyConfig` helper:
@@ -394,6 +474,8 @@ The helper encapsulates nil-safety, feature gate check, and lister access. Retur
 | `pkg/controllers/configobservation/interfaces.go` | Added `OperatorAuthLister`, `FeatureGateAccessor` fields |
 | `pkg/controllers/configobservation/configobservercontroller/observe_config_controller.go` | New params, operator auth informer registration |
 | `pkg/controllers/proxyconfig/proxyconfig_controller.go` | Component proxy validation, IdP endpoint validation (+ oauthLister), reads proxy CA from `openshift-config` directly |
+| `pkg/libs/endpointaccessible/endpoint_accessible_controller.go` | New: `EndpointProxyFunc` type, `NewEndpointAccessibleControllerWithProxy()`, proxy-aware `buildTLSClient()` |
+| `pkg/controllers/oauthendpoints/oauth_endpoints_controller.go` | `NewOAuthRouteCheckController` accepts operator auth lister + feature gate, builds proxy closure, uses `NewEndpointAccessibleControllerWithProxy` |
 | `pkg/operator/starter.go` | Updated wiring for all modified controllers |
 
 ---

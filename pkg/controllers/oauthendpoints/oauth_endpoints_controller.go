@@ -5,8 +5,11 @@ import (
 	"crypto/x509"
 	"fmt"
 	"net"
+	"net/http"
+	"net/url"
 	"strconv"
 
+	"golang.org/x/net/http/httpproxy"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
 
@@ -17,9 +20,11 @@ import (
 	routev1 "github.com/openshift/api/route/v1"
 	configv1informers "github.com/openshift/client-go/config/informers/externalversions/config/v1"
 	configv1lister "github.com/openshift/client-go/config/listers/config/v1"
+	operatorv1listers "github.com/openshift/client-go/operator/listers/operator/v1"
 	routev1informers "github.com/openshift/client-go/route/informers/externalversions/route/v1"
 	routev1listers "github.com/openshift/client-go/route/listers/route/v1"
 	"github.com/openshift/library-go/pkg/controller/factory"
+	"github.com/openshift/library-go/pkg/operator/configobserver/featuregates"
 	"github.com/openshift/library-go/pkg/operator/events"
 	"github.com/openshift/library-go/pkg/operator/v1helpers"
 
@@ -36,6 +41,9 @@ func NewOAuthRouteCheckController(
 	ingressInformerAllNamespaces configv1informers.IngressInformer,
 	authConfigChecker common.AuthConfigChecker,
 	systemCABundle []byte,
+	operatorAuthLister operatorv1listers.AuthenticationLister,
+	featureGateAccessor featuregates.FeatureGateAccess,
+	operatorAuthInformer factory.Informer,
 	recorder events.Recorder,
 ) factory.Controller {
 	cmLister := kubeInformersForConfigManagedNS.Core().V1().ConfigMaps().Lister()
@@ -56,6 +64,8 @@ func NewOAuthRouteCheckController(
 		return getOAuthRouteTLSConfig(cmLister, secretLister, ingressLister, systemCABundle)
 	}
 
+	getProxyFn := componentProxyFunc(featureGateAccessor, operatorAuthLister)
+
 	endpointCheckDisabledFunc := authConfigChecker.OIDCAvailable
 
 	informers := []factory.Informer{
@@ -63,15 +73,42 @@ func NewOAuthRouteCheckController(
 		secretInformer,
 		routeInformer,
 		ingressInformer,
+		operatorAuthInformer,
 	}
 	informers = append(informers, common.AuthConfigCheckerInformers[factory.Informer](&authConfigChecker)...)
 
-	return endpointaccessible.NewEndpointAccessibleController(
+	return endpointaccessible.NewEndpointAccessibleControllerWithProxy(
 		"OAuthServerRoute",
 		operatorClient,
-		endpointListFunc, getTLSConfigFunc, endpointCheckDisabledFunc,
+		endpointListFunc, getTLSConfigFunc, getProxyFn, endpointCheckDisabledFunc,
 		informers,
 		recorder)
+}
+
+func componentProxyFunc(
+	featureGateAccessor featuregates.FeatureGateAccess,
+	operatorAuthLister operatorv1listers.AuthenticationLister,
+) endpointaccessible.EndpointProxyFunc {
+	return func(req *http.Request) (*url.URL, error) {
+		authProxy, err := common.GetComponentProxyConfig(featureGateAccessor, operatorAuthLister)
+		if err != nil {
+			klog.Warningf("failed to get component proxy config for endpoint check, falling back to env proxy: %v", err)
+			return http.ProxyFromEnvironment(req)
+		}
+		if authProxy == nil {
+			return http.ProxyFromEnvironment(req)
+		}
+		httpProxy, httpsProxy, noProxy := common.ResolveProxyConfig(authProxy, nil)
+		if httpProxy == "" && httpsProxy == "" {
+			return nil, nil
+		}
+		proxyCfg := httpproxy.Config{
+			HTTPProxy:  httpProxy,
+			HTTPSProxy: httpsProxy,
+			NoProxy:    noProxy,
+		}
+		return proxyCfg.ProxyFunc()(req.URL)
+	}
 }
 
 // NewOAuthServiceCheckController returns a controller that checks the health of authentication service.

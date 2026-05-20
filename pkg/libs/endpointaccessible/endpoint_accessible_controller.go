@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -25,6 +26,7 @@ type endpointAccessibleController struct {
 	operatorClient            v1helpers.OperatorClient
 	endpointListFn            EndpointListFunc
 	getTLSConfigFn            EndpointTLSConfigFunc
+	getProxyFn                EndpointProxyFunc
 	availableConditionName    string
 	endpointCheckDisabledFunc EndpointCheckDisabledFunc
 }
@@ -32,6 +34,10 @@ type endpointAccessibleController struct {
 type EndpointListFunc func() ([]string, error)
 type EndpointTLSConfigFunc func() (*tls.Config, error)
 type EndpointCheckDisabledFunc func() (bool, error)
+
+// EndpointProxyFunc returns the proxy URL for a given request.
+// Matches the signature of http.Transport.Proxy.
+type EndpointProxyFunc func(*http.Request) (*url.URL, error)
 
 // NewEndpointAccessibleController returns a controller that checks if the endpoints
 // listed by endpointListFn are reachable
@@ -44,6 +50,34 @@ func NewEndpointAccessibleController(
 	triggers []factory.Informer,
 	recorder events.Recorder,
 ) factory.Controller {
+	return newEndpointAccessibleController(name, operatorClient, endpointListFn, getTLSConfigFn, nil, endpointCheckDisabledFunc, triggers, recorder)
+}
+
+// NewEndpointAccessibleControllerWithProxy is like NewEndpointAccessibleController
+// but accepts a proxy function that overrides http.ProxyFromEnvironment.
+func NewEndpointAccessibleControllerWithProxy(
+	name string,
+	operatorClient v1helpers.OperatorClient,
+	endpointListFn EndpointListFunc,
+	getTLSConfigFn EndpointTLSConfigFunc,
+	getProxyFn EndpointProxyFunc,
+	endpointCheckDisabledFunc EndpointCheckDisabledFunc,
+	triggers []factory.Informer,
+	recorder events.Recorder,
+) factory.Controller {
+	return newEndpointAccessibleController(name, operatorClient, endpointListFn, getTLSConfigFn, getProxyFn, endpointCheckDisabledFunc, triggers, recorder)
+}
+
+func newEndpointAccessibleController(
+	name string,
+	operatorClient v1helpers.OperatorClient,
+	endpointListFn EndpointListFunc,
+	getTLSConfigFn EndpointTLSConfigFunc,
+	getProxyFn EndpointProxyFunc,
+	endpointCheckDisabledFunc EndpointCheckDisabledFunc,
+	triggers []factory.Informer,
+	recorder events.Recorder,
+) factory.Controller {
 	controllerName := name + "EndpointAccessibleController"
 
 	c := &endpointAccessibleController{
@@ -51,6 +85,7 @@ func NewEndpointAccessibleController(
 		operatorClient:            operatorClient,
 		endpointListFn:            endpointListFn,
 		getTLSConfigFn:            getTLSConfigFn,
+		getProxyFn:                getProxyFn,
 		availableConditionName:    name + "EndpointAccessibleControllerAvailable",
 		endpointCheckDisabledFunc: endpointCheckDisabledFunc,
 	}
@@ -175,8 +210,13 @@ func (c *endpointAccessibleController) sync(ctx context.Context, syncCtx factory
 }
 
 func (c *endpointAccessibleController) buildTLSClient() (*http.Client, error) {
+	proxyFn := http.ProxyFromEnvironment
+	if c.getProxyFn != nil {
+		proxyFn = c.getProxyFn
+	}
+
 	transport := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
+		Proxy: proxyFn,
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: true,
 		},
