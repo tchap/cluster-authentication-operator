@@ -364,6 +364,10 @@ func prepareOauthOperator(
 		authConfigChecker,
 		authOperatorInput.eventRecorder,
 		resourceSyncController,
+		common.ComponentProxyFunc(
+			featureGateAccessor,
+			informerFactories.operatorInformer.Operator().V1().Authentications().Lister(),
+		),
 	)
 
 	// TODO remove this controller once we support Removed

@@ -5,11 +5,8 @@ import (
 	"crypto/x509"
 	"fmt"
 	"net"
-	"net/http"
-	"net/url"
 	"strconv"
 
-	"golang.org/x/net/http/httpproxy"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
 
@@ -64,7 +61,7 @@ func NewOAuthRouteCheckController(
 		return getOAuthRouteTLSConfig(cmLister, secretLister, ingressLister, systemCABundle)
 	}
 
-	getProxyFn := componentProxyFunc(featureGateAccessor, operatorAuthLister)
+	getProxyFn := common.ComponentProxyFunc(featureGateAccessor, operatorAuthLister)
 
 	endpointCheckDisabledFunc := authConfigChecker.OIDCAvailable
 
@@ -85,31 +82,6 @@ func NewOAuthRouteCheckController(
 		recorder)
 }
 
-func componentProxyFunc(
-	featureGateAccessor featuregates.FeatureGateAccess,
-	operatorAuthLister operatorv1listers.AuthenticationLister,
-) endpointaccessible.EndpointProxyFunc {
-	return func(req *http.Request) (*url.URL, error) {
-		authProxy, err := common.GetComponentProxyConfig(featureGateAccessor, operatorAuthLister)
-		if err != nil {
-			klog.Warningf("failed to get component proxy config for endpoint check, falling back to env proxy: %v", err)
-			return http.ProxyFromEnvironment(req)
-		}
-		if authProxy == nil {
-			return http.ProxyFromEnvironment(req)
-		}
-		httpProxy, httpsProxy, noProxy := common.ResolveProxyConfig(authProxy, nil)
-		if httpProxy == "" && httpsProxy == "" {
-			return nil, nil
-		}
-		proxyCfg := httpproxy.Config{
-			HTTPProxy:  httpProxy,
-			HTTPSProxy: httpsProxy,
-			NoProxy:    noProxy,
-		}
-		return proxyCfg.ProxyFunc()(req.URL)
-	}
-}
 
 // NewOAuthServiceCheckController returns a controller that checks the health of authentication service.
 func NewOAuthServiceCheckController(

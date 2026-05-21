@@ -3,6 +3,7 @@ package customroute
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"net/url"
 	"time"
 
@@ -52,6 +53,7 @@ type customRouteController struct {
 	resourceSyncer    resourcesynccontroller.ResourceSyncer
 	operatorClient    v1helpers.OperatorClient
 	authConfigChecker common.AuthConfigChecker
+	getProxyFn        func(*http.Request) (*url.URL, error)
 }
 
 func NewCustomRouteController(
@@ -68,6 +70,7 @@ func NewCustomRouteController(
 	authConfigChecker common.AuthConfigChecker,
 	eventRecorder events.Recorder,
 	resourceSyncer resourcesynccontroller.ResourceSyncer,
+	getProxyFn func(*http.Request) (*url.URL, error),
 ) factory.Controller {
 	controller := &customRouteController{
 		destSecret: types.NamespacedName{
@@ -86,6 +89,7 @@ func NewCustomRouteController(
 		operatorClient:    operatorClient,
 		resourceSyncer:    resourceSyncer,
 		authConfigChecker: authConfigChecker,
+		getProxyFn:        getProxyFn,
 	}
 
 	return factory.New().
@@ -253,7 +257,11 @@ func (c *customRouteController) updateIngressConfigStatus(ctx context.Context, i
 	if newConditions == nil {
 		newConditions = checkIngressURI(ingressConfig, route)
 		if newConditions == nil {
-			newConditions = checkRouteAvailablity(c.secretLister, ingressConfig, route)
+			proxyFn := http.ProxyFromEnvironment
+			if c.getProxyFn != nil {
+				proxyFn = c.getProxyFn
+			}
+			newConditions = checkRouteAvailablity(c.secretLister, ingressConfig, route, proxyFn)
 		}
 	}
 	newConditions = ensureDefaultConditions(newConditions)

@@ -2,6 +2,10 @@ package common
 
 import (
 	"fmt"
+	"net/http"
+	"net/url"
+
+	"golang.org/x/net/http/httpproxy"
 
 	configv1 "github.com/openshift/api/config/v1"
 	"github.com/openshift/api/features"
@@ -9,6 +13,7 @@ import (
 	operatorv1listers "github.com/openshift/client-go/operator/listers/operator/v1"
 	"github.com/openshift/library-go/pkg/operator/configobserver/featuregates"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/klog/v2"
 )
 
 // GetComponentProxyConfig returns the component-scoped proxy configuration
@@ -64,6 +69,35 @@ func ResolveProxyConfig(
 		return clusterProxy.Status.HTTPProxy, clusterProxy.Status.HTTPSProxy, clusterProxy.Status.NoProxy
 	}
 	return "", "", ""
+}
+
+// ComponentProxyFunc returns a proxy function that resolves the component-scoped
+// proxy on each call, falling back to http.ProxyFromEnvironment when no component
+// proxy is configured.
+func ComponentProxyFunc(
+	featureGateAccessor featuregates.FeatureGateAccess,
+	operatorAuthLister operatorv1listers.AuthenticationLister,
+) func(*http.Request) (*url.URL, error) {
+	return func(req *http.Request) (*url.URL, error) {
+		authProxy, err := GetComponentProxyConfig(featureGateAccessor, operatorAuthLister)
+		if err != nil {
+			klog.Warningf("failed to get component proxy config, falling back to env proxy: %v", err)
+			return http.ProxyFromEnvironment(req)
+		}
+		if authProxy == nil {
+			return http.ProxyFromEnvironment(req)
+		}
+		httpProxy, httpsProxy, noProxy := ResolveProxyConfig(authProxy, nil)
+		if httpProxy == "" && httpsProxy == "" {
+			return nil, nil
+		}
+		proxyCfg := httpproxy.Config{
+			HTTPProxy:  httpProxy,
+			HTTPSProxy: httpsProxy,
+			NoProxy:    noProxy,
+		}
+		return proxyCfg.ProxyFunc()(req.URL)
+	}
 }
 
 // staticNoProxy contains cluster-internal addresses that must bypass the proxy.

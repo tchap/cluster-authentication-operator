@@ -7,6 +7,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"net/http"
+	"net/url"
 	"reflect"
 	"time"
 
@@ -115,8 +116,8 @@ func degradeIfTimeElapsed(conditions []metav1.Condition, condition *v1.Condition
 	}
 }
 
-func checkRouteAvailablity(secretLister corev1listers.SecretLister, ingressConfig *configv1.Ingress, route *routev1.Route) []*v1.ConditionApplyConfiguration {
-	if err := routeAvailablity(secretLister, route.Spec.Host, ingressConfig); err != nil {
+func checkRouteAvailablity(secretLister corev1listers.SecretLister, ingressConfig *configv1.Ingress, route *routev1.Route, proxyFn func(*http.Request) (*url.URL, error)) []*v1.ConditionApplyConfiguration {
+	if err := routeAvailablity(secretLister, route.Spec.Host, ingressConfig, proxyFn); err != nil {
 		now := metav1.Now()
 		reason := "ErrorReachingOutToService"
 		message := fmt.Sprintf("unexpected error at %s: %v", route.Spec.Host, err)
@@ -137,7 +138,7 @@ func checkRouteAvailablity(secretLister corev1listers.SecretLister, ingressConfi
 	return nil
 }
 
-func routeAvailablity(secretLister corev1listers.SecretLister, host string, ingress *configv1.Ingress) error {
+func routeAvailablity(secretLister corev1listers.SecretLister, host string, ingress *configv1.Ingress, proxyFn func(*http.Request) (*url.URL, error)) error {
 	url := "https://" + host + "/healthz"
 
 	reqCtx, cancel := context.WithTimeout(context.TODO(), 10*time.Second) // avoid waiting forever
@@ -161,7 +162,7 @@ func routeAvailablity(secretLister corev1listers.SecretLister, host string, ingr
 	httpClient := http.Client{
 		Timeout: 5 * time.Second,
 		Transport: &http.Transport{
-			Proxy: http.ProxyFromEnvironment,
+			Proxy: proxyFn,
 			TLSClientConfig: &tls.Config{
 				RootCAs: rootCAs,
 			},
