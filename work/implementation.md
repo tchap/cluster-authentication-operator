@@ -402,6 +402,24 @@ Also add the operator auth informer to the triggers list so proxy config changes
 
 ---
 
+## Step 7: Custom route controller
+
+**File:** `pkg/controllers/customroute/custom_route_conditions.go`
+
+### Background
+
+The custom route controller checks OAuth route availability by hitting `https://<route-hostname>/healthz` in `routeAvailability()` (line 140). It uses `http.ProxyFromEnvironment` — same situation as the endpoint accessible controller. In a disconnected environment with only a component-scoped proxy, this check fails because no proxy env vars are set.
+
+### custom_route_conditions.go
+
+Update `routeAvailability()` to accept a proxy function and use it instead of `http.ProxyFromEnvironment`. The proxy function is built from the component proxy config using the same `componentProxyFunc` pattern as `oauth_endpoints_controller.go`.
+
+### starter.go
+
+Update `NewCustomRouteController` wiring to pass the operator auth lister and feature gate accessor.
+
+---
+
 ## Feature gate guard pattern
 
 All call sites use the `GetComponentProxyConfig` helper:
@@ -462,6 +480,7 @@ The helper encapsulates nil-safety, feature gate check, lister access, and zero-
 | `pkg/controllers/proxyconfig/proxyconfig_controller.go` | Component proxy validation, IdP endpoint validation (+ oauthLister), reads proxy CA from `openshift-config` directly |
 | `pkg/libs/endpointaccessible/endpoint_accessible_controller.go` | New: `EndpointProxyFunc` type, `NewEndpointAccessibleControllerWithProxy()`, proxy-aware `buildTLSClient()` |
 | `pkg/controllers/oauthendpoints/oauth_endpoints_controller.go` | `NewOAuthRouteCheckController` accepts operator auth lister + feature gate, builds proxy closure, uses `NewEndpointAccessibleControllerWithProxy` |
+| `pkg/controllers/customroute/custom_route_conditions.go` | `routeAvailability()` updated to use component proxy instead of `http.ProxyFromEnvironment` |
 | `pkg/operator/starter.go` | Updated wiring for all modified controllers |
 
 ---
