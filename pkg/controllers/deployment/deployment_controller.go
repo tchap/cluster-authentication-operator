@@ -332,8 +332,7 @@ func (c *oauthServerDeploymentSyncer) getConfigResourceVersions() ([]string, err
 		return nil, fmt.Errorf("unable to list configmaps in %q namespace: %v", "openshift-authentication", err)
 	}
 	for _, cm := range configMaps {
-		if strings.HasPrefix(cm.Name, "v4-0-config-") {
-			// prefix the RV to make it clear where it came from since each resource can be from different etcd
+		if strings.HasPrefix(cm.Name, "v4-0-config-") && cm.Name != componentProxyCAConfigMapName {
 			configRVs = append(configRVs, "configmaps:"+cm.Name+":"+cm.ResourceVersion)
 		}
 	}
@@ -369,8 +368,9 @@ const (
 )
 
 // syncComponentProxyCA copies the component-scoped proxy CA ConfigMap from
-// openshift-config to openshift-authentication and adds volume/mount + entrypoint
-// append to the OAuth Server deployment so the CA is included in system trust.
+// openshift-config to openshift-authentication and adds volume/mount to the
+// OAuth Server deployment. The OAuth Server hot-reloads the CA file on change,
+// so no redeployment is needed for CA content updates.
 func (c *oauthServerDeploymentSyncer) syncComponentProxyCA(
 	ctx context.Context,
 	syncContext factory.SyncContext,
@@ -427,27 +427,6 @@ func (c *oauthServerDeploymentSyncer) syncComponentProxyCA(
 			ReadOnly:  true,
 			MountPath: componentProxyCAMountPath,
 		},
-	)
-
-	// Inject entrypoint append to add component proxy CA to system trust.
-	// The existing entrypoint copies system trust then runs the server;
-	// insert the append block before the exec line.
-	appendBlock := fmt.Sprintf(
-		"\nif [ -s %s/ca-bundle.crt ]; then\n"+
-			"    echo \"Appending component proxy CA bundle\"\n"+
-			"    cat %s/ca-bundle.crt >> /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem\n"+
-			"fi\n",
-		componentProxyCAMountPath, componentProxyCAMountPath,
-	)
-	entrypoint := deployment.Spec.Template.Spec.Containers[0].Args[0]
-	if !strings.Contains(entrypoint, "exec oauth-server") {
-		return fmt.Errorf("could not find 'exec oauth-server' marker in container entrypoint for CA injection")
-	}
-	deployment.Spec.Template.Spec.Containers[0].Args[0] = strings.Replace(
-		entrypoint,
-		"exec oauth-server",
-		appendBlock+"exec oauth-server",
-		1,
 	)
 
 	return nil

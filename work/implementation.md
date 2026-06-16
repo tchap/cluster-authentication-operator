@@ -135,18 +135,18 @@ New method `syncComponentProxyCA()` called from `Sync()`:
 2. Read source ConfigMap from `openshift-config` via `sourceConfigMapLister`
 3. Apply as `v4-0-config-system-auth-proxy-ca` in `openshift-authentication` (for the OAuth Server)
 4. Add volume + volume mount to the deployment
-5. Verify `"exec oauth-server"` marker exists in the entrypoint (error if missing)
-6. Inject entrypoint append block via `strings.Replace` on the marker
 
 No copy to `openshift-authentication-operator` -- the config observer and proxy validation controller read the source CA directly from `openshift-config` via the existing `ConfigMapLister`, eliminating a cross-namespace copy and extra informer.
 
-The ConfigMap in `openshift-authentication` uses the `v4-0-config-` prefix so `getConfigResourceVersions()` automatically picks it up for deployment hash tracking, triggering rollouts on CA changes.
-
 ### trustedCA ConfigMap watching
 
-The EP requires: "CAO must watch the source ConfigMap in `openshift-config`, copy it into `openshift-authentication` on any change, and re-deploy OAuth Server so that the updated ConfigMap is picked up."
+CAO must watch the source ConfigMap in `openshift-config` and copy it into `openshift-authentication` on any change.
 
-This is fulfilled by registering `kubeInformersForSourceNamespace.Core().V1().ConfigMaps().Informer()` in the deployment controller's namespaced informers (line 162 of `deployment_controller.go`). Any change to ConfigMaps in `openshift-config` triggers a controller re-sync, which calls `syncComponentProxyCA()` to re-copy the source ConfigMap via `resourceapply.ApplyConfigMap()`. The re-copied ConfigMap gets a new ResourceVersion, which is picked up by `getConfigResourceVersions()` (via the `v4-0-config-` prefix), changing the deployment hash and triggering a rollout.
+This is fulfilled by registering `kubeInformersForSourceNamespace.Core().V1().ConfigMaps().Informer()` in the deployment controller's namespaced informers (line 162 of `deployment_controller.go`). Any change to ConfigMaps in `openshift-config` triggers a controller re-sync, which calls `syncComponentProxyCA()` to re-copy the source ConfigMap via `resourceapply.ApplyConfigMap()`.
+
+A redeployment is only triggered when the volume/mount configuration changes (adding or removing `trustedCA`), not on CA content updates. Kubelet propagates ConfigMap content changes to the mounted volume, and the OAuth Server's file watcher picks up the change automatically (see OAuth Server section below).
+
+The ConfigMap in `openshift-authentication` must NOT use the `v4-0-config-` prefix in `getConfigResourceVersions()` deployment hash tracking — otherwise CA content changes would trigger unnecessary rollouts. Only proxy env var changes should trigger redeployment.
 
 Volume name and mount follow existing conventions:
 ```
@@ -155,15 +155,15 @@ Mount: /var/config/system/configmaps/v4-0-config-system-auth-proxy-ca
 ConfigMap is optional (ptr.To(true))
 ```
 
-Entrypoint append inserted before the `exec` line:
-```bash
-if [ -s /var/config/system/configmaps/v4-0-config-system-auth-proxy-ca/ca-bundle.crt ]; then
-    echo "Appending component proxy CA bundle"
-    cat /var/config/system/configmaps/v4-0-config-system-auth-proxy-ca/ca-bundle.crt >> /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
-fi
-```
+### OAuth Server CA hot-reload
 
-This runs after the existing system trust copy, so the result is: system trust + cluster-wide proxy CA + component proxy CA.
+The OAuth Server watches the mounted CA file and hot-reloads it on change, avoiding redeployment on CA rotation. This requires a change in the oauth-server repo.
+
+The OAuth Server creates HTTP transports at startup via `transportFor()` (`pkg/oauthserver/auth.go`), which reads CA files from disk once and builds a static `tls.Config.RootCAs`. These transports are passed to IdP providers and reused for the process lifetime.
+
+Implementation: a new `dynamicCARoundTripper` type wraps the transport and uses `DynamicFileCAContent` from `k8s.io/apiserver/pkg/server/dynamiccertificates` to watch the CA file via fsnotify. When the CA changes, the wrapper rebuilds the underlying `http.Transport` with the updated cert pool and swaps it in atomically (`atomic.Pointer`). `transportFor()` returns this wrapper instead of a static transport.
+
+This is transparent to IdP providers — no changes to the `Provider` interface or any provider implementation. The `DynamicFileCAContent` controller needs the server context for clean shutdown, which requires threading the context through `newOAuthServerConfig()` → `getOAuthProvider()` → `transportFor()`.
 
 ---
 

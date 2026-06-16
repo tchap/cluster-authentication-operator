@@ -263,31 +263,19 @@ cp -f .../ca-bundle.crt /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
 
 The component-scoped `trustedCA` ConfigMap is admin-provided and won't be processed by the CA bundle injector (no label), so the operator must handle merging.
 
-**When `spec.proxy.trustedCA` is set**, the component CA must be merged with the existing trust chain (system trust + cluster-wide proxy CA). The entrypoint append approach is used: sync the component CA ConfigMap as-is, mount it as an additional volume, and extend the container entrypoint to concatenate it after the existing system trust copy.
+**When `spec.proxy.trustedCA` is set**, the component CA ConfigMap is synced into `openshift-authentication` and mounted as a volume. The OAuth Server hot-reloads the CA file on change, avoiding redeployment for CA rotation.
 
-1. **Sync** the referenced ConfigMap from `openshift-config` to `openshift-authentication` via direct `resourceapply.ApplyConfigMap()` in the deployment controller's `Sync()`. The `resourceSyncController.SyncConfigMap()` cannot be used because it registers a fixed source→destination mapping at startup, but the source name (`spec.proxy.trustedCA.name`) is dynamic. The synced ConfigMap uses the `v4-0-config-system-auth-proxy-ca` name so `getConfigResourceVersions()` automatically picks it up for deployment hash tracking, triggering rollouts on CA changes.
+1. **Sync** the referenced ConfigMap from `openshift-config` to `openshift-authentication` via direct `resourceapply.ApplyConfigMap()` in the deployment controller's `Sync()`. The `resourceSyncController.SyncConfigMap()` cannot be used because it registers a fixed source→destination mapping at startup, but the source name (`spec.proxy.trustedCA.name`) is dynamic.
 
 2. **Mount** it as an additional volume in the OAuth Server deployment (at `/var/config/system/configmaps/v4-0-config-system-auth-proxy-ca`), marked as optional.
 
-3. **Append to system trust** by extending the container entrypoint:
-
-    ```bash
-    if [ -s /var/config/system/configmaps/v4-0-config-system-auth-proxy-ca/ca-bundle.crt ]; then
-        echo "Appending component proxy CA bundle"
-        cat /var/config/system/configmaps/v4-0-config-system-auth-proxy-ca/ca-bundle.crt \
-            >> /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
-    fi
-    ```
-
-    This runs after the existing `cp -f` of the injected system trust bundle, so the result is system trust + cluster-wide proxy CA + component-scoped proxy CA. The volume, mount, and entrypoint injection are done dynamically in the deployment controller, not in the static YAML template (matching the pattern used for custom router certs).
+3. **Hot-reload in OAuth Server**: the OAuth Server's `transportFor()` (`pkg/oauthserver/auth.go`) is updated to return a dynamic `RoundTripper` wrapper that uses `DynamicFileCAContent` from `k8s.io/apiserver/pkg/server/dynamiccertificates` to watch the mounted CA file via fsnotify. When the CA changes, the wrapper rebuilds the underlying `http.Transport` with the updated cert pool and swaps it in atomically. This is transparent to IdP providers — no changes to the `Provider` interface or any provider implementation. A redeployment is only triggered when the volume/mount configuration changes (adding or removing `trustedCA`), not on CA content updates. The synced ConfigMap must NOT be included in `getConfigResourceVersions()` deployment hash tracking.
 
 4. **CAO process**: load the component CA into the cert pool in `TransportForCARefWithProxy()` and in the proxy validation controller's `getCACerts()` (which already uses `AppendCertsFromPEM` to load from a configurable set of ConfigMaps). The config observer and proxy validation controller read the proxy CA directly from `openshift-config` via the existing cross-namespace `ConfigMapLister`, eliminating a second cross-namespace copy.
 
-5. **Watch for changes**: CAO must watch the source ConfigMap in `openshift-config`, copy it into `openshift-authentication` on any change, and re-deploy OAuth Server so that the updated ConfigMap is picked up. The deployment controller registers the `openshift-config` ConfigMap informer (`kubeInformersForSourceNamespace.Core().V1().ConfigMaps().Informer()`) in its namespaced informers, so changes to the source CA ConfigMap trigger a controller re-sync, ConfigMap re-copy, and rollout via the `v4-0-config-` prefix hash tracking.
+5. **Watch for changes**: the deployment controller registers the `openshift-config` ConfigMap informer in its namespaced informers, so changes to the source CA ConfigMap trigger a controller re-sync and ConfigMap re-copy via `resourceapply.ApplyConfigMap()`. Kubelet propagates the updated content to the mounted volume, and the OAuth Server's file watcher picks it up automatically.
 
 6. **Cleanup**: when `spec.proxy.trustedCA` is removed, `syncComponentProxyCA()` deletes the stale `v4-0-config-system-auth-proxy-ca` ConfigMap from `openshift-authentication`.
-
-An alternative (server-side merge in the `trustdistribution` controller) was considered but rejected: it would add a new reconciliation loop with ordering constraints (merged ConfigMap must be ready before pod starts) and source-watching complexity, while the entrypoint approach is straightforward and extends an existing pattern.
 
 #### OAuth Server deployment injection
 
