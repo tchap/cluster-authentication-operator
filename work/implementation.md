@@ -135,6 +135,7 @@ New method `syncComponentProxyCA()` called from `Sync()`:
 2. Read source ConfigMap from `openshift-config` via `sourceConfigMapLister`
 3. Apply as `v4-0-config-system-auth-proxy-ca` in `openshift-authentication` (for the OAuth Server)
 4. Add volume + volume mount to the deployment
+5. Set `PROXY_TRUSTED_CA_FILE` env var on the container pointing to the mounted CA bundle path (`/var/config/system/configmaps/v4-0-config-system-auth-proxy-ca/ca-bundle.crt`). The OAuth Server reads this at startup and uses it to create proxy-CA-aware transports with dynamic reload.
 
 No copy to `openshift-authentication-operator` -- the config observer and proxy validation controller read the source CA directly from `openshift-config` via the existing `ConfigMapLister`, eliminating a cross-namespace copy and extra informer.
 
@@ -157,13 +158,15 @@ ConfigMap is optional (ptr.To(true))
 
 ### OAuth Server CA hot-reload
 
-The OAuth Server watches the mounted CA file and hot-reloads it on change, avoiding redeployment on CA rotation. This requires a change in the oauth-server repo.
+The OAuth Server watches the mounted proxy CA file and hot-reloads it on change, avoiding redeployment on CA rotation. This is implemented in the oauth-server repo.
 
-The OAuth Server creates HTTP transports at startup via `transportFor()` (`pkg/oauthserver/auth.go`), which reads CA files from disk once and builds a static `tls.Config.RootCAs`. These transports are passed to IdP providers and reused for the process lifetime.
+The proxy CA path is communicated via the `PROXY_TRUSTED_CA_FILE` environment variable, set by the deployment controller alongside `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`. The value is the mounted CA bundle path: `/var/config/system/configmaps/v4-0-config-system-auth-proxy-ca/ca-bundle.crt`.
 
-Implementation: a new `dynamicCARoundTripper` type wraps the transport and uses `DynamicFileCAContent` from `k8s.io/apiserver/pkg/server/dynamiccertificates` to watch the CA file via fsnotify. When the CA changes, the wrapper rebuilds the underlying `http.Transport` with the updated cert pool and swaps it in atomically (`atomic.Pointer`). `transportFor()` returns this wrapper instead of a static transport.
+**Implementation (oauth-server):** `transportFor()` and `transportForInner()` in `pkg/oauthserver/auth.go` are converted from package-level functions to methods on `*OAuthServerConfig`. When `PROXY_TRUSTED_CA_FILE` is set, `transportForInner` creates a `dynamicCARoundTripper` (`pkg/oauthserver/dynamic_transport.go`) instead of a static transport. The round tripper uses `DynamicFileCAContent` from `k8s.io/apiserver/pkg/server/dynamiccertificates` to watch the proxy CA file via fsnotify. On change, it rebuilds the underlying `http.Transport` with an updated cert pool that combines the static IdP CA (`provider.CA`, loaded via `cert.CertsFromFile`) and the dynamic proxy CA (`CurrentCABundleContent()`), and swaps it in atomically (`atomic.Pointer[http.Transport]`). On rebuild failure the old transport is preserved. `old.CloseIdleConnections()` drains stale connections after swap.
 
-This is transparent to IdP providers — no changes to the `Provider` interface or any provider implementation. The `DynamicFileCAContent` controller needs the server context for clean shutdown, which requires threading the context through `newOAuthServerConfig()` → `getOAuthProvider()` → `transportFor()`.
+The `DynamicFileCAContent` controller is started via a `"openshift.io-StartDynamicCAWatchers"` PostStartHook registered in `NewOAuthServerConfig()` (`pkg/oauthserver/oauth_apiserver.go`). The `PostStartHookContext` embeds `context.Context` which is cancelled on server shutdown, providing clean lifecycle management without threading context through the config construction chain.
+
+This is transparent to IdP providers — no changes to the `Provider` interface or any provider implementation. When `PROXY_TRUSTED_CA_FILE` is not set, the static transport behavior is preserved (backward compatible).
 
 ---
 
@@ -441,7 +444,7 @@ The helper encapsulates nil-safety, feature gate check, lister access, and zero-
 
 2. **Source namespace informer:** The deployment controller now watches `openshift-config` ConfigMaps via `kubeInformersForSourceNamespace`. This ensures changes to the source CA ConfigMap trigger a controller re-sync and ConfigMap re-copy.
 
-3. **`v4-0-config-` prefix naming:** The synced ConfigMap in `openshift-authentication` uses this prefix so it's automatically included in `getConfigResourceVersions()` deployment hash tracking.
+3. **`v4-0-config-` prefix naming:** The synced ConfigMap in `openshift-authentication` is named `v4-0-config-system-auth-proxy-ca` for consistency with existing volume naming conventions. However, it must NOT be included in `getConfigResourceVersions()` deployment hash tracking — otherwise CA content changes would trigger unnecessary rollouts. Only proxy env var changes (add/remove) should trigger redeployment; CA content updates are picked up by the OAuth Server's file watcher.
 
 4. **Transport builder closure:** Instead of threading 4 proxy params through the IDP conversion call chain, a `transport.CARefTransportFunc` closure is built once at the top level and passed down. Leaf functions (`discoverOpenIDURLs`, `checkOIDCPasswordGrantFlow`) call the closure without knowing about proxy. This also allowed removing `cmLister` from their signatures since it was only used for transport creation.
 
@@ -455,7 +458,7 @@ The helper encapsulates nil-safety, feature gate check, lister access, and zero-
 
     **API field types:** The API uses non-pointer `string` fields with `omitempty` and `MinLength=1` (aligned with `config.openshift.io/v1 Proxy`). The `Proxy` struct uses `omitzero` instead of a pointer. `GetComponentProxyConfig` returns a `*AuthenticationProxyConfig` (nil = not configured) by checking for the zero-value struct internally. `ResolveProxyConfig` accesses fields directly as strings — no `ptr.Deref`. A CEL validation rule (`has(self.httpProxy) || has(self.httpsProxy)`) enforces that at least one proxy URL is set at the CRD level, and a URL-presence guard in `ResolveProxyConfig` provides defense-in-depth. `ConfigMapNameReference` is replaced by a local `AuthenticationConfigMapReference` type with `MinLength`/`MaxLength` name validations.
 
-9. **Entrypoint injection guard:** `syncComponentProxyCA` verifies the `"exec oauth-server"` marker exists in the container entrypoint before attempting string replacement. Returns an error instead of silently failing if the deployment template changes.
+9. **Env var for proxy CA path:** The proxy CA file path is communicated to the OAuth Server via the `PROXY_TRUSTED_CA_FILE` environment variable rather than entrypoint string replacement. This avoids fragile shell script manipulation and aligns with how `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` are already injected. The OAuth Server reads the env var at startup in `NewOAuthServerConfig()` via `os.Getenv("PROXY_TRUSTED_CA_FILE")`.
 
 10. **Static noProxy defaults:** The component-scoped proxy bypasses the CNO's `proxy.status.noProxy` computation. There is no user-configurable `noProxy` field -- the operator always sets `NO_PROXY` to static cluster-internal defaults (`.cluster.local`, `.svc`, `localhost`, `127.0.0.1`). Auth components use DNS names (covered by `.svc`/`.cluster.local`) for all internal connections.
 
