@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 
 	"golang.org/x/net/http/httpproxy"
 
@@ -13,6 +14,7 @@ import (
 	operatorv1listers "github.com/openshift/client-go/operator/listers/operator/v1"
 	"github.com/openshift/library-go/pkg/operator/configobserver/featuregates"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
 )
 
@@ -63,7 +65,7 @@ func ResolveProxyConfig(
 	clusterProxy *configv1.Proxy,
 ) (httpProxy, httpsProxy, noProxy string) {
 	if authProxy != nil && (authProxy.HTTPProxy != "" || authProxy.HTTPSProxy != "") {
-		return authProxy.HTTPProxy, authProxy.HTTPSProxy, staticNoProxy
+		return authProxy.HTTPProxy, authProxy.HTTPSProxy, mergeNoProxy(authProxy.NoProxy)
 	}
 	if clusterProxy != nil {
 		return clusterProxy.Status.HTTPProxy, clusterProxy.Status.HTTPSProxy, clusterProxy.Status.NoProxy
@@ -100,7 +102,19 @@ func ComponentProxyFunc(
 	}
 }
 
-// staticNoProxy contains cluster-internal addresses that must bypass the proxy.
-// Auth components connect to internal services via DNS names covered by .svc and
-// .cluster.local, so network CIDRs and api-int hostname are not needed.
-const staticNoProxy = ".cluster.local,.svc,127.0.0.1,localhost"
+// staticNoProxyEntries contains cluster-internal addresses that must bypass the
+// proxy. Auth components connect to internal services via DNS names covered by
+// .svc and .cluster.local, so network CIDRs and api-int hostname are not needed.
+var staticNoProxyEntries = []string{".cluster.local", ".svc", "127.0.0.1", "localhost"}
+
+// mergeNoProxy combines user-provided noProxy entries with static cluster-internal
+// defaults, deduplicating and sorting for deterministic output.
+func mergeNoProxy(userNoProxy string) string {
+	entries := sets.New[string](staticNoProxyEntries...)
+	for _, e := range strings.Split(userNoProxy, ",") {
+		if trimmed := strings.TrimSpace(e); trimmed != "" {
+			entries.Insert(trimmed)
+		}
+	}
+	return strings.Join(sets.List(entries), ",")
+}

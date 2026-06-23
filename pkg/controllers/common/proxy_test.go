@@ -31,7 +31,27 @@ func TestResolveProxyConfig(t *testing.T) {
 			},
 			wantHTTPProxy:  "http://component:3128",
 			wantHTTPSProxy: "http://component:3129",
-			wantNoProxy:    staticNoProxy,
+			wantNoProxy:    ".cluster.local,.svc,127.0.0.1,localhost",
+		},
+		{
+			name: "component proxy with user noProxy merges with defaults",
+			authProxy: &operatorv1.AuthenticationProxyConfig{
+				HTTPProxy: "http://component:3128",
+				NoProxy:   "idp.example.com,.corp.example.com",
+			},
+			wantHTTPProxy:  "http://component:3128",
+			wantHTTPSProxy: "",
+			wantNoProxy:    ".cluster.local,.corp.example.com,.svc,127.0.0.1,idp.example.com,localhost",
+		},
+		{
+			name: "component proxy with user noProxy duplicating defaults deduplicates",
+			authProxy: &operatorv1.AuthenticationProxyConfig{
+				HTTPProxy: "http://component:3128",
+				NoProxy:   ".svc,idp.example.com,127.0.0.1",
+			},
+			wantHTTPProxy:  "http://component:3128",
+			wantHTTPSProxy: "",
+			wantNoProxy:    ".cluster.local,.svc,127.0.0.1,idp.example.com,localhost",
 		},
 		{
 			name:      "nil component proxy falls back to cluster proxy",
@@ -79,7 +99,7 @@ func TestResolveProxyConfig(t *testing.T) {
 			},
 			wantHTTPProxy:  "",
 			wantHTTPSProxy: "http://component:3129",
-			wantNoProxy:    staticNoProxy,
+			wantNoProxy:    ".cluster.local,.svc,127.0.0.1,localhost",
 		},
 	}
 
