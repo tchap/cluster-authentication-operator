@@ -21,7 +21,7 @@ func ResolveProxyConfig(
     clusterProxy *configv1.Proxy,
 ) (httpProxy, httpsProxy, noProxy string) {
     if authProxy != nil && (authProxy.HTTPProxy != "" || authProxy.HTTPSProxy != "") {
-        return authProxy.HTTPProxy, authProxy.HTTPSProxy, staticNoProxy
+        return authProxy.HTTPProxy, authProxy.HTTPSProxy, mergeNoProxy(authProxy.NoProxy)
     }
     if clusterProxy != nil {
         return clusterProxy.Status.HTTPProxy, clusterProxy.Status.HTTPSProxy, clusterProxy.Status.NoProxy
@@ -29,14 +29,24 @@ func ResolveProxyConfig(
     return "", "", ""
 }
 
-const staticNoProxy = ".cluster.local,.svc,127.0.0.1,localhost"
+var staticNoProxyEntries = []string{".cluster.local", ".svc", "127.0.0.1", "localhost"}
+
+func mergeNoProxy(userNoProxy string) string {
+    entries := sets.New[string](staticNoProxyEntries...)
+    for _, e := range strings.Split(userNoProxy, ",") {
+        if trimmed := strings.TrimSpace(e); trimmed != "" {
+            entries.Insert(trimmed)
+        }
+    }
+    return strings.Join(sets.List(entries), ",")
+}
 ```
 
-Pure function, no feature gate logic -- callers decide whether to pass `authProxy` based on the gate. Fields are accessed directly as strings (no `ptr.Deref`). The URL-presence guard ensures a proxy struct with only `trustedCA` set falls through to the cluster-wide proxy. Unit tests in `proxy_test.go` covering resolution states plus partial-values case.
+Pure function, no feature gate logic -- callers decide whether to pass `authProxy` based on the gate. Fields are accessed directly as strings (no `ptr.Deref`). The URL-presence guard ensures a proxy struct with only `trustedCA` set falls through to the cluster-wide proxy. `mergeNoProxy` uses a set to merge user entries with static defaults, deduplicating and sorting for deterministic output. Unit tests in `proxy_test.go` covering resolution states plus partial-values case.
 
-### Static noProxy defaults
+### noProxy defaults
 
-When the component-scoped proxy is active, `NO_PROXY` is always set to static cluster-internal defaults (`.cluster.local`, `.svc`, `127.0.0.1`, `localhost`). There is no user-configurable `noProxy` field -- per-IdP proxy configuration is a non-goal.
+When the component-scoped proxy is active, `NO_PROXY` is set to the union of user-provided `noProxy` entries and static cluster-internal defaults (`.cluster.local`, `.svc`, `127.0.0.1`, `localhost`). The static defaults are always included to prevent accidentally proxying internal cluster traffic. When `noProxy` is omitted, only the static defaults are used.
 
 Auth components connect to internal services via DNS names covered by `.svc` and `.cluster.local`. Network CIDRs and the api-int hostname are not needed. The cluster-wide proxy branch returns `.status.noProxy` as-is -- those defaults are already computed by the CNO.
 
@@ -460,7 +470,7 @@ The helper encapsulates nil-safety, feature gate check, lister access, and zero-
 
 9. **Env var for proxy CA path:** The proxy CA file path is communicated to the OAuth Server via the `PROXY_TRUSTED_CA_FILE` environment variable rather than entrypoint string replacement. This avoids fragile shell script manipulation and aligns with how `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` are already injected. The OAuth Server reads the env var at startup in `NewOAuthServerConfig()` via `os.Getenv("PROXY_TRUSTED_CA_FILE")`.
 
-10. **Static noProxy defaults:** The component-scoped proxy bypasses the CNO's `proxy.status.noProxy` computation. There is no user-configurable `noProxy` field -- the operator always sets `NO_PROXY` to static cluster-internal defaults (`.cluster.local`, `.svc`, `localhost`, `127.0.0.1`). Auth components use DNS names (covered by `.svc`/`.cluster.local`) for all internal connections.
+10. **noProxy merging:** The component-scoped proxy bypasses the CNO's `proxy.status.noProxy` computation. User-provided `noProxy` entries are merged with static cluster-internal defaults (`.cluster.local`, `.svc`, `localhost`, `127.0.0.1`) using a set for deduplication. The static defaults are always included to prevent accidentally proxying internal cluster traffic. `sets.List` produces sorted, deterministic output.
 
 11. **IdP validation severity:** IdP endpoint validation uses warning-level logging instead of returning errors (which would set Degraded). External IdPs can be transiently unreachable for reasons unrelated to proxy configuration. Proxy-level failures (connection refused to the proxy, TLS handshake errors with the proxy itself) still trigger Degraded. Validation runs only on config change (tracked by hash) to avoid hammering IdP endpoints every sync cycle.
 
