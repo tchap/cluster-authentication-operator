@@ -37,7 +37,7 @@ func TestResolveProxyConfig(t *testing.T) {
 			name: "component proxy with user noProxy merges with defaults",
 			authProxy: &operatorv1.AuthenticationProxyConfig{
 				HTTPProxy: "http://component:3128",
-				NoProxy:   "idp.example.com,.corp.example.com",
+				NoProxy:   []string{"idp.example.com", ".corp.example.com"},
 			},
 			wantHTTPProxy:  "http://component:3128",
 			wantHTTPSProxy: "",
@@ -47,7 +47,7 @@ func TestResolveProxyConfig(t *testing.T) {
 			name: "component proxy with user noProxy duplicating defaults deduplicates",
 			authProxy: &operatorv1.AuthenticationProxyConfig{
 				HTTPProxy: "http://component:3128",
-				NoProxy:   ".svc,idp.example.com,127.0.0.1",
+				NoProxy:   []string{".svc", "idp.example.com", "127.0.0.1"},
 			},
 			wantHTTPProxy:  "http://component:3128",
 			wantHTTPSProxy: "",

@@ -49,6 +49,7 @@ type AuthenticationSpec struct {
 // AuthenticationProxyConfig holds proxy configuration scoped to
 // authentication components (the OAuth server and the cluster
 // authentication operator).
+// +kubebuilder:validation:MinProperties=1
 // +kubebuilder:validation:XValidation:rule="has(self.httpProxy) || has(self.httpsProxy)",message="at least one of httpProxy or httpsProxy must be specified"
 type AuthenticationProxyConfig struct {
 	// httpProxy is the URL of the proxy for HTTP requests.
@@ -83,16 +84,21 @@ type AuthenticationProxyConfig struct {
 	// +optional
 	HTTPSProxy string `json:"httpsProxy,omitempty"`
 
-	// noProxy is a comma-separated list of hostnames and/or CIDRs
-	// and/or IPs for which the proxy should not be used. Entries that
-	// are not valid hostnames, CIDRs, or IPs are silently ignored.
-	// Cluster-internal defaults (.cluster.local, .svc, 127.0.0.1,
-	// localhost) are always appended automatically and do not need
-	// to be included. Maximum length is 2048 characters.
-	// +kubebuilder:validation:MaxLength=2048
-	// +kubebuilder:validation:XValidation:rule="self.split(',').all(e, e.trim().size() > 0)",message="noProxy must not contain empty entries"
+	// noProxy is a list of hostnames and/or CIDRs and/or IPs for which
+	// the proxy should not be used. Must contain at least one entry
+	// when set. Each entry must be between 1 and 253 characters long
+	// and at most 64 entries are allowed. Duplicate
+	// entries are not permitted. Entries that are not valid hostnames,
+	// CIDRs, or IPs are silently ignored. Cluster-internal defaults
+	// (.cluster.local, .svc, 127.0.0.1, localhost) are always appended
+	// automatically and do not need to be included.
+	// +listType=set
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=64
+	// +kubebuilder:validation:items:MinLength=1
+	// +kubebuilder:validation:items:MaxLength=253
 	// +optional
-	NoProxy string `json:"noProxy,omitempty"`
+	NoProxy []string `json:"noProxy,omitempty"`
 
 	// trustedCA is a reference to a ConfigMap in the openshift-config
 	// namespace containing a CA certificate bundle under the key
@@ -131,6 +137,11 @@ type OAuthAPIServerStatus struct {
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	LatestAvailableRevision int32 `json:"latestAvailableRevision,omitempty"`
+
+	// encryptionStatus contains status reports for the KMS plugin health and its key rotation.
+	// +optional
+	// +openshift:enable:FeatureGate=KMSEncryption
+	EncryptionStatus KMSEncryptionStatus `json:"encryptionStatus,omitempty,omitzero"`
 }
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object

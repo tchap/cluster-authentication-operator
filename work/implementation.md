@@ -31,13 +31,9 @@ func ResolveProxyConfig(
 
 var staticNoProxyEntries = []string{".cluster.local", ".svc", "127.0.0.1", "localhost"}
 
-func mergeNoProxy(userNoProxy string) string {
+func mergeNoProxy(userNoProxy []string) string {
     entries := sets.New[string](staticNoProxyEntries...)
-    for _, e := range strings.Split(userNoProxy, ",") {
-        if trimmed := strings.TrimSpace(e); trimmed != "" {
-            entries.Insert(trimmed)
-        }
-    }
+    entries.Insert(userNoProxy...)
     return strings.Join(sets.List(entries), ",")
 }
 ```

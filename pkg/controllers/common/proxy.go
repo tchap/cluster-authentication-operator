@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"reflect"
 	"strings"
 
 	"golang.org/x/net/http/httpproxy"
@@ -45,7 +46,7 @@ func GetComponentProxyConfig(
 		return nil, fmt.Errorf("failed to get operator.openshift.io/v1 authentication/cluster: %v", err)
 	}
 	proxy := authOp.Spec.Proxy
-	if (proxy == operatorv1.AuthenticationProxyConfig{}) {
+	if reflect.ValueOf(proxy).IsZero() {
 		return nil, nil
 	}
 	return &proxy, nil
@@ -109,12 +110,8 @@ var staticNoProxyEntries = []string{".cluster.local", ".svc", "127.0.0.1", "loca
 
 // mergeNoProxy combines user-provided noProxy entries with static cluster-internal
 // defaults, deduplicating and sorting for deterministic output.
-func mergeNoProxy(userNoProxy string) string {
+func mergeNoProxy(userNoProxy []string) string {
 	entries := sets.New[string](staticNoProxyEntries...)
-	for _, e := range strings.Split(userNoProxy, ",") {
-		if trimmed := strings.TrimSpace(e); trimmed != "" {
-			entries.Insert(trimmed)
-		}
-	}
+	entries.Insert(userNoProxy...)
 	return strings.Join(sets.List(entries), ",")
 }
