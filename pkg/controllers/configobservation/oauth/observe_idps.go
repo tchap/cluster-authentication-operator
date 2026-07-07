@@ -1,6 +1,8 @@
 package oauth
 
 import (
+	"net/http"
+
 	"k8s.io/klog/v2"
 
 	"k8s.io/apimachinery/pkg/api/equality"
@@ -10,8 +12,10 @@ import (
 	"github.com/openshift/library-go/pkg/operator/configobserver"
 	"github.com/openshift/library-go/pkg/operator/events"
 
+	"github.com/openshift/cluster-authentication-operator/pkg/controllers/common"
 	"github.com/openshift/cluster-authentication-operator/pkg/controllers/configobservation"
 	"github.com/openshift/cluster-authentication-operator/pkg/operator/datasync"
+	"github.com/openshift/cluster-authentication-operator/pkg/transport"
 )
 
 var identityProvidersMounts = []string{"volumesToMount", "identityProviders"}
@@ -50,9 +54,14 @@ func ObserveIdentityProviders(genericlisters configobserver.Listers, recorder ev
 		return existingConfig, append(errs, err)
 	}
 
+	buildTransport, err := buildIDPTransport(listers)
+	if err != nil {
+		return existingConfig, append(errs, err)
+	}
+
 	// convert identity providers from config to oauth-configuration API and
 	// extract the CMs and Secrets that need to be synchronized to the target NS
-	convertedObservedIdentityProviders, observedSyncData, idpErrs := convertIdentityProviders(listers.ConfigMapLister, listers.SecretsLister, oauthConfig.Spec.IdentityProviders)
+	convertedObservedIdentityProviders, observedSyncData, idpErrs := convertIdentityProviders(listers.SecretsLister, oauthConfig.Spec.IdentityProviders, buildTransport)
 	if len(idpErrs) > 0 {
 		return existingConfig, append(errs, idpErrs...)
 	}
@@ -99,4 +108,23 @@ func GetIDPConfigSyncData(observedConfig map[string]interface{}) (*datasync.Conf
 	}
 
 	return datasync.NewConfigSyncDataFromJSON(currentSyncDataBytes)
+}
+
+// buildIDPTransport returns a transport builder that uses the resolved proxy settings.
+func buildIDPTransport(listers configobservation.Listers) (transportForCABuilderFunc, error) {
+	proxy, err := common.ResolveProxy(listers.FeatureGateAccessor, listers.OperatorAuthLister)
+	if err != nil {
+		return nil, err
+	}
+
+	return func(caConfigMapName, caConfigMapKey string) (http.RoundTripper, error) {
+		var caRefs []transport.CAReference
+		if len(caConfigMapName) > 0 {
+			caRefs = append(caRefs, transport.CAReference{ConfigMapName: caConfigMapName, ConfigMapKey: caConfigMapKey})
+		}
+		if len(proxy.TrustedCAName) > 0 {
+			caRefs = append(caRefs, transport.CAReference{ConfigMapName: proxy.TrustedCAName, ConfigMapKey: "ca-bundle.crt"})
+		}
+		return transport.TransportForCARef(listers.ConfigMapLister, caRefs, proxy.HTTPProxy, proxy.HTTPSProxy, proxy.NoProxy)
+	}, nil
 }

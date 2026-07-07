@@ -12,17 +12,20 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
 	"k8s.io/client-go/informers"
 	coreinformers "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/kubernetes"
 	appsv1client "k8s.io/client-go/kubernetes/typed/apps/v1"
+	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 	appsv1listers "k8s.io/client-go/listers/apps/v1"
 	corev1listers "k8s.io/client-go/listers/core/v1"
 	"k8s.io/klog/v2"
+	"k8s.io/utils/ptr"
 
-	configv1 "github.com/openshift/api/config/v1"
 	configinformer "github.com/openshift/client-go/config/informers/externalversions"
-	configv1listers "github.com/openshift/client-go/config/listers/config/v1"
+	operatorv1informers "github.com/openshift/client-go/operator/informers/externalversions/operator/v1"
+	operatorv1listers "github.com/openshift/client-go/operator/listers/operator/v1"
 	routeinformers "github.com/openshift/client-go/route/informers/externalversions"
 	routev1listers "github.com/openshift/client-go/route/listers/route/v1"
 	"github.com/openshift/cluster-authentication-operator/bindata"
@@ -30,6 +33,7 @@ import (
 	bootstrap "github.com/openshift/library-go/pkg/authentication/bootstrapauthenticator"
 	"github.com/openshift/library-go/pkg/controller/factory"
 	"github.com/openshift/library-go/pkg/operator/apiserver/controller/workload"
+	"github.com/openshift/library-go/pkg/operator/configobserver/featuregates"
 	"github.com/openshift/library-go/pkg/operator/events"
 	"github.com/openshift/library-go/pkg/operator/resource/resourceapply"
 	"github.com/openshift/library-go/pkg/operator/resource/resourcemerge"
@@ -37,6 +41,11 @@ import (
 	"github.com/openshift/library-go/pkg/operator/status"
 	"github.com/openshift/library-go/pkg/operator/v1helpers"
 	"github.com/openshift/library-go/pkg/route/routeapihelpers"
+)
+
+const (
+	componentProxyCAConfigMapName = "v4-0-config-system-auth-proxy-ca"
+	componentProxyCAMountPath     = "/var/config/system/configmaps/" + componentProxyCAConfigMapName
 )
 
 var _ workload.Delegate = &oauthServerDeploymentSyncer{}
@@ -49,6 +58,7 @@ type nodeCountFunc func(nodeSelector map[string]string) (*int32, error)
 type ensureAtMostOnePodPerNodeFunc func(spec *appsv1.DeploymentSpec, componentName string) error
 
 type oauthServerDeploymentSyncer struct {
+	name           string
 	operatorClient v1helpers.OperatorClient
 
 	// countNodes a function to return count of nodes on which the workload will be installed
@@ -60,11 +70,15 @@ type oauthServerDeploymentSyncer struct {
 	deployments       appsv1client.DeploymentsGetter
 	deploymentsLister appsv1listers.DeploymentLister
 
-	configMapLister corev1listers.ConfigMapLister
-	secretLister    corev1listers.SecretLister
-	podsLister      corev1listers.PodLister
-	proxyLister     configv1listers.ProxyLister
-	routeLister     routev1listers.RouteLister
+	configMaps            corev1client.ConfigMapsGetter
+	configMapLister       corev1listers.ConfigMapLister
+	sourceConfigMapLister corev1listers.ConfigMapLister // openshift-config namespace
+	secretLister          corev1listers.SecretLister
+	podsLister            corev1listers.PodLister
+	routeLister           routev1listers.RouteLister
+
+	operatorAuthLister  operatorv1listers.AuthenticationLister
+	featureGateAccessor featuregates.FeatureGateAccess
 
 	authConfigChecker          common.AuthConfigChecker
 	bootstrapUserDataGetter    bootstrap.BootstrapUserDataGetter
@@ -83,11 +97,15 @@ func NewOAuthServerWorkloadController(
 	eventsRecorder events.Recorder,
 	versionRecorder status.VersionGetter,
 	kubeInformersForTargetNamespace informers.SharedInformerFactory,
+	kubeInformersForSourceNamespace informers.SharedInformerFactory,
 	authConfigChecker common.AuthConfigChecker,
+	operatorAuthInformer operatorv1informers.AuthenticationInformer,
+	featureGateAccessor featuregates.FeatureGateAccess,
 ) factory.Controller {
 	targetNS := "openshift-authentication"
 
 	oauthDeploymentSyncer := &oauthServerDeploymentSyncer{
+		name:           "OAuthServerDeploymentController",
 		operatorClient: operatorClient,
 
 		countNodes:                countNodes,
@@ -96,11 +114,15 @@ func NewOAuthServerWorkloadController(
 		deployments:       kubeClient.AppsV1(),
 		deploymentsLister: kubeInformersForTargetNamespace.Apps().V1().Deployments().Lister(),
 
-		configMapLister: kubeInformersForTargetNamespace.Core().V1().ConfigMaps().Lister(),
-		secretLister:    kubeInformersForTargetNamespace.Core().V1().Secrets().Lister(),
-		podsLister:      kubeInformersForTargetNamespace.Core().V1().Pods().Lister(),
-		proxyLister:     configInformers.Config().V1().Proxies().Lister(),
-		routeLister:     routeInformersForTargetNamespace.Route().V1().Routes().Lister(),
+		configMaps:            kubeClient.CoreV1(),
+		configMapLister:       kubeInformersForTargetNamespace.Core().V1().ConfigMaps().Lister(),
+		sourceConfigMapLister: kubeInformersForSourceNamespace.Core().V1().ConfigMaps().Lister(),
+		secretLister:          kubeInformersForTargetNamespace.Core().V1().Secrets().Lister(),
+		podsLister:            kubeInformersForTargetNamespace.Core().V1().Pods().Lister(),
+		routeLister:           routeInformersForTargetNamespace.Route().V1().Routes().Lister(),
+
+		operatorAuthLister:  operatorAuthInformer.Lister(),
+		featureGateAccessor: featureGateAccessor,
 
 		authConfigChecker:       authConfigChecker,
 		bootstrapUserDataGetter: bootstrapUserDataGetter,
@@ -115,8 +137,8 @@ func NewOAuthServerWorkloadController(
 
 	clusterScopedInformers := []factory.Informer{
 		configInformers.Config().V1().Ingresses().Informer(),
-		configInformers.Config().V1().Proxies().Informer(),
 		nodeInformer.Informer(),
+		operatorAuthInformer.Informer(),
 	}
 	clusterScopedInformers = append(clusterScopedInformers, common.AuthConfigCheckerInformers[factory.Informer](&authConfigChecker)...)
 
@@ -138,6 +160,10 @@ func NewOAuthServerWorkloadController(
 			kubeInformersForTargetNamespace.Core().V1().Pods().Informer(),
 			kubeInformersForTargetNamespace.Core().V1().Namespaces().Informer(),
 			routeInformersForTargetNamespace.Route().V1().Routes().Informer(),
+			// Watches all ConfigMaps in openshift-config because the proxy CA ConfigMap
+			// name is dynamic (from Authentication CR). A NamesFilter can't be used since
+			// the name isn't known at construction time.
+			kubeInformersForSourceNamespace.Core().V1().ConfigMaps().Informer(),
 		},
 		oauthDeploymentSyncer,
 		eventsRecorder,
@@ -196,7 +222,7 @@ func (c *oauthServerDeploymentSyncer) Sync(ctx context.Context, syncContext fact
 		return nil, false, append(errs, err)
 	}
 
-	proxyConfig, err := c.getProxyConfig()
+	proxy, err := common.ResolveProxy(c.featureGateAccessor, c.operatorAuthLister)
 	if err != nil {
 		return nil, false, append(errs, err)
 	}
@@ -209,9 +235,8 @@ func (c *oauthServerDeploymentSyncer) Sync(ctx context.Context, syncContext fact
 	// TODO move this hash from deployment meta to operatorConfig.status.generations.[...].hash
 	resourceVersions := []string{}
 
-	if len(proxyConfig.Name) > 0 {
-		resourceVersions = append(resourceVersions, "proxy:"+proxyConfig.Name+":"+proxyConfig.ResourceVersion)
-	}
+	resourceVersions = append(resourceVersions,
+		fmt.Sprintf("proxy:%s:%s:%s", proxy.HTTPProxy, proxy.HTTPSProxy, proxy.NoProxy))
 
 	configResourceVersions, err := c.getConfigResourceVersions()
 	if err != nil {
@@ -231,7 +256,7 @@ func (c *oauthServerDeploymentSyncer) Sync(ctx context.Context, syncContext fact
 	}
 
 	// deployment, have RV of all resources
-	expectedDeployment, err := getOAuthServerDeployment(operatorSpec, proxyConfig, c.bootstrapUserChangeRollOut, resourceVersions...)
+	expectedDeployment, err := getOAuthServerDeployment(operatorSpec, proxy.HTTPProxy, proxy.HTTPSProxy, proxy.NoProxy, c.bootstrapUserChangeRollOut, resourceVersions...)
 	if err != nil {
 		return nil, false, append(errs, err)
 	}
@@ -250,6 +275,10 @@ func (c *oauthServerDeploymentSyncer) Sync(ctx context.Context, syncContext fact
 			ReadOnly:  true,
 			MountPath: "/var/config/system/secrets/v4-0-config-system-custom-router-certs",
 		})
+	}
+
+	if err := c.syncComponentProxyCA(ctx, proxy.TrustedCAName, expectedDeployment); err != nil {
+		return nil, false, append(errs, fmt.Errorf("syncing component proxy CA: %v", err))
 	}
 
 	err = c.ensureAtMostOnePodPerNode(&expectedDeployment.Spec, "oauth-openshift")
@@ -281,18 +310,6 @@ func (c *oauthServerDeploymentSyncer) Sync(ctx context.Context, syncContext fact
 	return deployment, true, errs
 }
 
-func (c *oauthServerDeploymentSyncer) getProxyConfig() (*configv1.Proxy, error) {
-	proxyConfig, err := c.proxyLister.Get("cluster")
-	if err != nil {
-		if errors.IsNotFound(err) {
-			klog.V(4).Infof("No proxy configuration found, defaulting to empty")
-			return &configv1.Proxy{}, nil
-		}
-		return nil, fmt.Errorf("unable to get cluster proxy configuration: %v", err)
-	}
-	return proxyConfig, nil
-}
-
 func (c *oauthServerDeploymentSyncer) getConfigResourceVersions() ([]string, error) {
 	var configRVs []string
 
@@ -301,8 +318,9 @@ func (c *oauthServerDeploymentSyncer) getConfigResourceVersions() ([]string, err
 		return nil, fmt.Errorf("unable to list configmaps in %q namespace: %v", "openshift-authentication", err)
 	}
 	for _, cm := range configMaps {
-		if strings.HasPrefix(cm.Name, "v4-0-config-") {
-			// prefix the RV to make it clear where it came from since each resource can be from different etcd
+		// Exclude the proxy CA configmap: its content is hot-reloaded by the
+		// OAuth server, so CA updates must not trigger a rollout.
+		if strings.HasPrefix(cm.Name, "v4-0-config-") && cm.Name != componentProxyCAConfigMapName {
 			configRVs = append(configRVs, "configmaps:"+cm.Name+":"+cm.ResourceVersion)
 		}
 	}
@@ -330,4 +348,67 @@ func setRollingUpdateParameters(controlPlaneCount int32, deployment *appsv1.Depl
 	maxSurge := intstr.FromInt32(controlPlaneCount)
 	deployment.Spec.Strategy.RollingUpdate.MaxUnavailable = &maxUnavailable
 	deployment.Spec.Strategy.RollingUpdate.MaxSurge = &maxSurge
+}
+
+// syncComponentProxyCA copies the component-scoped proxy CA ConfigMap from
+// openshift-config to openshift-authentication and adds volume/mount to the
+// OAuth Server deployment. The OAuth Server hot-reloads the CA file on change,
+// so no redeployment is needed for CA content updates.
+func (c *oauthServerDeploymentSyncer) syncComponentProxyCA(
+	ctx context.Context,
+	trustedCAName string,
+	deployment *appsv1.Deployment,
+) error {
+	if len(trustedCAName) == 0 {
+		// Check the lister before calling Delete: the manifestclient used in
+		// integration tests rejects Delete requests whose body (DeleteOptions)
+		// carries no namespace, so we avoid an unnecessary call when the
+		// configmap doesn't exist.
+		_, err := c.configMapLister.ConfigMaps("openshift-authentication").Get(componentProxyCAConfigMapName)
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("failed to check component proxy CA configmap \"%s/%s\": %w", "openshift-authentication", componentProxyCAConfigMapName, err)
+		}
+		if err := c.configMaps.ConfigMaps("openshift-authentication").Delete(
+			ctx, componentProxyCAConfigMapName, metav1.DeleteOptions{},
+		); err != nil && !errors.IsNotFound(err) {
+			return fmt.Errorf("failed to delete component proxy CA configmap \"%s/%s\" : %w", "openshift-authentication", componentProxyCAConfigMapName, err)
+		}
+		return nil
+	}
+
+	sourceCM, err := c.sourceConfigMapLister.ConfigMaps("openshift-config").Get(trustedCAName)
+	if err != nil {
+		return fmt.Errorf("failed to get component proxy CA configmap \"%s/%s\": %w", "openshift-config", trustedCAName, err)
+	}
+
+	targetCM := corev1ac.ConfigMap(componentProxyCAConfigMapName, "openshift-authentication").WithData(sourceCM.Data)
+	if _, err := c.configMaps.ConfigMaps("openshift-authentication").Apply(
+		ctx, targetCM, metav1.ApplyOptions{FieldManager: c.name, Force: true},
+	); err != nil {
+		return fmt.Errorf("failed to apply component proxy CA configmap \"%s/%s\": %w", "openshift-authentication", componentProxyCAConfigMapName, err)
+	}
+
+	deployment.Spec.Template.Spec.Volumes = append(deployment.Spec.Template.Spec.Volumes, corev1.Volume{
+		Name: componentProxyCAConfigMapName,
+		VolumeSource: corev1.VolumeSource{
+			ConfigMap: &corev1.ConfigMapVolumeSource{
+				LocalObjectReference: corev1.LocalObjectReference{
+					Name: componentProxyCAConfigMapName,
+				},
+				Optional: ptr.To(true),
+			},
+		},
+	})
+	deployment.Spec.Template.Spec.Containers[0].VolumeMounts = append(
+		deployment.Spec.Template.Spec.Containers[0].VolumeMounts,
+		corev1.VolumeMount{
+			Name:      componentProxyCAConfigMapName,
+			ReadOnly:  true,
+			MountPath: componentProxyCAMountPath,
+		},
+	)
+	return nil
 }

@@ -2,26 +2,33 @@ package proxyconfig
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
-
-	"golang.org/x/net/http/httpproxy"
 
 	corev1lister "k8s.io/client-go/listers/core/v1"
 	"k8s.io/klog/v2"
 
+	configv1 "github.com/openshift/api/config/v1"
+	configv1listers "github.com/openshift/client-go/config/listers/config/v1"
+	operatorv1informers "github.com/openshift/client-go/operator/informers/externalversions/operator/v1"
+	operatorv1listers "github.com/openshift/client-go/operator/listers/operator/v1"
 	routeinformer "github.com/openshift/client-go/route/informers/externalversions/route/v1"
 	v1 "github.com/openshift/client-go/route/listers/route/v1"
-	"github.com/openshift/cluster-authentication-operator/pkg/controllers/common"
 	"github.com/openshift/library-go/pkg/controller/factory"
+	"github.com/openshift/library-go/pkg/operator/configobserver/featuregates"
 	"github.com/openshift/library-go/pkg/operator/events"
 	"github.com/openshift/library-go/pkg/operator/v1helpers"
 	"github.com/openshift/library-go/pkg/route/routeapihelpers"
+
+	"github.com/openshift/cluster-authentication-operator/pkg/controllers/common"
+	"github.com/openshift/cluster-authentication-operator/pkg/transport"
 )
 
 // proxyConfigChecker reports bad proxy configurations.
@@ -32,7 +39,13 @@ type proxyConfigChecker struct {
 	routeNamespace  string
 	caConfigMaps    map[string][]string // ns -> []configmapNames
 
+	oauthLister         configv1listers.OAuthLister
+	operatorAuthLister  operatorv1listers.AuthenticationLister
+	featureGateAccessor featuregates.FeatureGateAccess
+
 	authConfigChecker common.AuthConfigChecker
+
+	lastIdPValidationHash string
 }
 
 func NewProxyConfigChecker(
@@ -43,14 +56,21 @@ func NewProxyConfigChecker(
 	routeName string,
 	caConfigMaps map[string][]string,
 	recorder events.Recorder,
-	operatorClient v1helpers.OperatorClient) factory.Controller {
+	operatorClient v1helpers.OperatorClient,
+	oauthLister configv1listers.OAuthLister,
+	operatorAuthInformer operatorv1informers.AuthenticationInformer,
+	featureGateAccessor featuregates.FeatureGateAccess,
+) factory.Controller {
 	p := proxyConfigChecker{
-		routeLister:       routeInformer.Lister(),
-		configMapLister:   configMapInformers.ConfigMapLister(),
-		routeName:         routeName,
-		routeNamespace:    routeNamespace,
-		caConfigMaps:      caConfigMaps,
-		authConfigChecker: authConfigChecker,
+		routeLister:         routeInformer.Lister(),
+		configMapLister:     configMapInformers.ConfigMapLister(),
+		routeName:           routeName,
+		routeNamespace:      routeNamespace,
+		caConfigMaps:        caConfigMaps,
+		oauthLister:         oauthLister,
+		operatorAuthLister:  operatorAuthInformer.Lister(),
+		featureGateAccessor: featureGateAccessor,
+		authConfigChecker:   authConfigChecker,
 	}
 
 	c := factory.New().
@@ -59,6 +79,7 @@ func NewProxyConfigChecker(
 			routeInformer.Informer(),
 		).
 		WithInformers(common.AuthConfigCheckerInformers[factory.Informer](&authConfigChecker)...).
+		WithInformers(operatorAuthInformer.Informer()).
 		ResyncEvery(60 * time.Minute).
 		WithSyncDegradedOnError(operatorClient)
 
@@ -72,37 +93,111 @@ func NewProxyConfigChecker(
 	return c.ToController("ProxyConfigController", recorder.WithComponentSuffix("proxy-config-controller"))
 }
 
-// sync attempts to connect to route using configured proxy settings and reports any error.
-func (p *proxyConfigChecker) sync(ctx context.Context, _ factory.SyncContext) error {
+// sync attempts to connect to the route using the active proxy settings and reports
+// any misconfiguration. ResolveProxy returns effective proxy settings for both
+// cluster-wide and component-scoped proxies, so the validation logic is the same.
+func (p *proxyConfigChecker) sync(ctx context.Context, syncCtx factory.SyncContext) error {
 	if oidcAvailable, err := p.authConfigChecker.OIDCAvailable(); err != nil {
 		return err
 	} else if oidcAvailable {
 		return nil
 	}
 
-	proxyConfig := httpproxy.FromEnvironment()
-	if !isProxyConfigured(proxyConfig) {
-		// If proxy is not configured, then it is a no-op.
+	proxy, err := common.ResolveProxy(p.featureGateAccessor, p.operatorAuthLister)
+	if err != nil {
+		return err
+	}
+	if !proxy.IsProxyConfigured() {
 		return nil
 	}
 
-	route, err := p.routeLister.Routes(p.routeNamespace).Get(p.routeName)
+	routeURL, err := p.getRouteHealthzURL()
 	if err != nil {
 		return err
 	}
 
-	routeURL, _, err := routeapihelpers.IngressURI(route, "")
-	if err != nil {
-		return err
-	}
-	routeURL.Path = "healthz"
-
-	clientWithProxy, clientWithoutProxy, err := p.createHTTPClients()
+	clientWithProxy, clientWithoutProxy, err := p.createHTTPClients(proxy)
 	if err != nil {
 		return err
 	}
 
-	return checkProxyConfig(ctx, routeURL, proxyConfig.NoProxy, clientWithProxy, clientWithoutProxy)
+	if err := checkProxyConfig(ctx, routeURL, proxy.NoProxy, clientWithProxy, clientWithoutProxy); err != nil {
+		return err
+	}
+
+	p.validateIdPConnectivity(ctx, syncCtx.Recorder(), clientWithProxy, proxy.HTTPProxy, proxy.HTTPSProxy, proxy.NoProxy)
+	return nil
+}
+
+// validateIdPConnectivity tests that configured IdP endpoints are reachable through
+// the proxy. Only runs on config change (tracked by hash). Reports warnings
+// for transient IdP failures instead of returning errors (which would set Degraded),
+// since external IdPs can be unreachable for reasons unrelated to proxy configuration.
+func (p *proxyConfigChecker) validateIdPConnectivity(ctx context.Context, recorder events.Recorder, client *http.Client, httpProxy, httpsProxy, noProxy string) {
+	oauthConfig, err := p.oauthLister.Get("cluster")
+	if err != nil {
+		klog.Warningf("unable to get oauth config for IdP validation: %v", err)
+		return
+	}
+
+	idpURLs := extractIdPURLs(oauthConfig)
+	if len(idpURLs) == 0 {
+		return
+	}
+
+	hash := computeIdPValidationHash(httpProxy, httpsProxy, noProxy, idpURLs)
+	if hash == p.lastIdPValidationHash {
+		return
+	}
+
+	var unreachable []string
+	for _, idpURL := range idpURLs {
+		if err := isEndpointReachable(ctx, idpURL, client); err != nil {
+			klog.Warningf("IdP endpoint unreachable through proxy: %v", err)
+			unreachable = append(unreachable, err.Error())
+		}
+	}
+	if len(unreachable) > 0 {
+		recorder.Warningf("IdPEndpointUnreachable", "IdP endpoints unreachable through proxy: %s", strings.Join(unreachable, "; "))
+	} else {
+		p.lastIdPValidationHash = hash
+	}
+}
+
+// extractIdPURLs returns external URLs from configured identity providers.
+func extractIdPURLs(oauthConfig *configv1.OAuth) []string {
+	var urls []string
+	for _, idp := range oauthConfig.Spec.IdentityProviders {
+		switch {
+		case idp.OpenID != nil && len(idp.OpenID.Issuer) > 0:
+			issuer := strings.TrimSuffix(idp.OpenID.Issuer, "/")
+			urls = append(urls, issuer+"/.well-known/openid-configuration")
+		case idp.GitHub != nil:
+			host := idp.GitHub.Hostname
+			if len(host) == 0 {
+				host = "github.com"
+			}
+			urls = append(urls, "https://"+host)
+		case idp.GitLab != nil && len(idp.GitLab.URL) > 0:
+			urls = append(urls, idp.GitLab.URL)
+		case idp.Keystone != nil && len(idp.Keystone.URL) > 0:
+			urls = append(urls, idp.Keystone.URL)
+		case idp.BasicAuth != nil && len(idp.BasicAuth.URL) > 0:
+			urls = append(urls, idp.BasicAuth.URL)
+		case idp.Google != nil:
+			urls = append(urls, "https://accounts.google.com")
+		}
+	}
+	return urls
+}
+
+func computeIdPValidationHash(httpProxy, httpsProxy, noProxy string, idpURLs []string) string {
+	h := sha256.New()
+	fmt.Fprintf(h, "%s\n%s\n%s\n", httpProxy, httpsProxy, noProxy)
+	for _, u := range idpURLs {
+		fmt.Fprintf(h, "%s\n", u)
+	}
+	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
 // checkProxyConfig determines any mis-configuration in proxy settings by attempting
@@ -129,21 +224,43 @@ func checkProxyConfig(ctx context.Context, endpointURL *url.URL, noProxy string,
 	return nil
 }
 
-// createHTTPClients returns two http clients, one with proxy and another without proxy
-func (p *proxyConfigChecker) createHTTPClients() (*http.Client, *http.Client, error) {
+func (p *proxyConfigChecker) getRouteHealthzURL() (*url.URL, error) {
+	route, err := p.routeLister.Routes(p.routeNamespace).Get(p.routeName)
+	if err != nil {
+		return nil, err
+	}
+	routeURL, _, err := routeapihelpers.IngressURI(route, "")
+	if err != nil {
+		return nil, err
+	}
+	routeURL.Path = "healthz"
+	return routeURL, nil
+}
+
+// createHTTPClients returns two HTTP clients — one that routes through the proxy
+// and one that connects directly. The proxy's trustedCA bundle (if any) is loaded
+// and appended to the system CA pool.
+func (p *proxyConfigChecker) createHTTPClients(proxy *common.ResolvedProxy) (*http.Client, *http.Client, error) {
 	caPool, err := p.getCACerts()
 	if err != nil {
 		return nil, nil, err
 	}
 
-	tlsConfig := &tls.Config{
-		RootCAs: caPool,
+	if len(proxy.TrustedCAName) > 0 {
+		caData, err := transport.LoadCAData(p.configMapLister, proxy.TrustedCAName, "ca-bundle.crt")
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to load proxy CA: %w", err)
+		}
+		caPool.AppendCertsFromPEM(caData)
 	}
+
+	tlsConfig := &tls.Config{RootCAs: caPool}
+	proxyFn := func(req *http.Request) (*url.URL, error) { return proxy.ProxyFunc()(req.URL) }
 
 	return &http.Client{
 			Transport: &http.Transport{
 				TLSClientConfig: tlsConfig,
-				Proxy:           proxyFunc,
+				Proxy:           proxyFn,
 			},
 		}, &http.Client{
 			Transport: &http.Transport{
@@ -195,29 +312,6 @@ func isEndpointReachable(ctx context.Context, endpointURL string, client *http.C
 		return fmt.Errorf("%q returned %d", endpointURL, resp.StatusCode)
 	}
 	return nil
-}
-
-func isProxyConfigured(proxyConfig *httpproxy.Config) bool {
-	return proxyConfig != nil && (len(proxyConfig.HTTPProxy) != 0 || len(proxyConfig.HTTPSProxy) != 0)
-}
-
-// proxyFunc returns the proxy URL to be used for a given request
-// when NO_PROXY is ignored.
-func proxyFunc(req *http.Request) (*url.URL, error) {
-	proxyConfig := httpproxy.FromEnvironment()
-	if req.URL.Scheme == "https" && len(proxyConfig.HTTPSProxy) > 0 {
-		proxyURL, err := url.Parse(proxyConfig.HTTPSProxy)
-		if err == nil {
-			return proxyURL, nil
-		}
-		klog.V(4).Infof("failed to parse https proxy %q", proxyConfig.HTTPSProxy)
-	}
-
-	proxyURL, err := url.Parse(proxyConfig.HTTPProxy)
-	if err != nil {
-		return nil, err
-	}
-	return proxyURL, nil
 }
 
 // newLazyChecker returns a function that calculates an error value once

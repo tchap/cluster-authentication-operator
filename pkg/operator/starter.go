@@ -189,6 +189,8 @@ func prepareOauthOperator(
 		resourceSyncController,
 		enabledClusterCapabilities,
 		authOperatorInput.eventRecorder,
+		informerFactories.operatorInformer.Operator().V1().Authentications(),
+		featureGateAccessor,
 	)
 
 	routerCertsController := routercerts.NewRouterCertsDomainValidationController(
@@ -281,7 +283,10 @@ func prepareOauthOperator(
 		authOperatorInput.eventRecorder,
 		versionRecorder,
 		informerFactories.kubeInformersForNamespaces.InformersFor("openshift-authentication"),
+		informerFactories.kubeInformersForNamespaces.InformersFor("openshift-config"),
 		authConfigChecker,
+		informerFactories.operatorInformer.Operator().V1().Authentications(),
+		featureGateAccessor,
 	)
 
 	workersAvailableController := ingressnodesavailable.NewIngressNodesAvailableController(
@@ -304,6 +309,8 @@ func prepareOauthOperator(
 		informerFactories.kubeInformersForNamespaces.InformersFor("openshift-config-managed"),
 		informerFactories.namespacedOpenshiftAuthenticationRoutes.Route().V1().Routes(),
 		informerFactories.operatorConfigInformer.Config().V1().Ingresses(),
+		informerFactories.operatorInformer.Operator().V1().Authentications(),
+		featureGateAccessor,
 		authConfigChecker,
 		systemCABundle,
 		authOperatorInput.eventRecorder,
@@ -335,6 +342,9 @@ func prepareOauthOperator(
 		},
 		authOperatorInput.eventRecorder,
 		authOperatorInput.authenticationOperatorClient,
+		informerFactories.operatorConfigInformer.Config().V1().OAuths().Lister(),
+		informerFactories.operatorInformer.Operator().V1().Authentications(),
+		featureGateAccessor,
 	)
 
 	customRouteController := componentroutesecretsync.NewCustomRouteController(
@@ -347,6 +357,8 @@ func prepareOauthOperator(
 		informerFactories.namespacedOpenshiftAuthenticationRoutes.Route().V1().Routes(),
 		authOperatorInput.routeClient.RouteV1().Routes("openshift-authentication"),
 		informerFactories.kubeInformersForNamespaces,
+		informerFactories.operatorInformer.Operator().V1().Authentications(),
+		featureGateAccessor,
 		authOperatorInput.authenticationOperatorClient,
 		authConfigChecker,
 		authOperatorInput.eventRecorder,
