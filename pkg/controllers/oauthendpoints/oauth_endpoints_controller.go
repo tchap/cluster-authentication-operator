@@ -5,6 +5,7 @@ import (
 	"crypto/x509"
 	"fmt"
 	"net"
+	"net/url"
 	"strconv"
 
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -17,14 +18,17 @@ import (
 	routev1 "github.com/openshift/api/route/v1"
 	configv1informers "github.com/openshift/client-go/config/informers/externalversions/config/v1"
 	configv1lister "github.com/openshift/client-go/config/listers/config/v1"
+	operatorv1informers "github.com/openshift/client-go/operator/informers/externalversions/operator/v1"
 	routev1informers "github.com/openshift/client-go/route/informers/externalversions/route/v1"
 	routev1listers "github.com/openshift/client-go/route/listers/route/v1"
 	"github.com/openshift/library-go/pkg/controller/factory"
+	"github.com/openshift/library-go/pkg/operator/configobserver/featuregates"
 	"github.com/openshift/library-go/pkg/operator/events"
 	"github.com/openshift/library-go/pkg/operator/v1helpers"
 
 	"github.com/openshift/cluster-authentication-operator/pkg/controllers/common"
 	"github.com/openshift/cluster-authentication-operator/pkg/libs/endpointaccessible"
+	"github.com/openshift/cluster-authentication-operator/pkg/transport"
 )
 
 // NewOAuthRouteCheckController returns a controller that checks the health of authentication route.
@@ -34,6 +38,8 @@ func NewOAuthRouteCheckController(
 	kubeInformersForConfigManagedNS informers.SharedInformerFactory,
 	routeInformerNamespaces routev1informers.RouteInformer,
 	ingressInformerAllNamespaces configv1informers.IngressInformer,
+	operatorAuthInformer operatorv1informers.AuthenticationInformer,
+	featureGateAccessor featuregates.FeatureGateAccess,
 	authConfigChecker common.AuthConfigChecker,
 	systemCABundle []byte,
 	recorder events.Recorder,
@@ -56,6 +62,14 @@ func NewOAuthRouteCheckController(
 		return getOAuthRouteTLSConfig(cmLister, secretLister, ingressLister, systemCABundle)
 	}
 
+	getProxyFn := transport.ProxyFunc(func(reqURL *url.URL) (*url.URL, error) {
+		proxy, err := common.ResolveProxy(featureGateAccessor, operatorAuthInformer.Lister())
+		if err != nil {
+			return nil, err
+		}
+		return proxy.ProxyFunc()(reqURL)
+	})
+
 	endpointCheckDisabledFunc := authConfigChecker.OIDCAvailable
 
 	informers := []factory.Informer{
@@ -63,13 +77,14 @@ func NewOAuthRouteCheckController(
 		secretInformer,
 		routeInformer,
 		ingressInformer,
+		operatorAuthInformer.Informer(),
 	}
 	informers = append(informers, common.AuthConfigCheckerInformers[factory.Informer](&authConfigChecker)...)
 
-	return endpointaccessible.NewEndpointAccessibleController(
+	return endpointaccessible.NewEndpointAccessibleControllerWithProxy(
 		"OAuthServerRoute",
 		operatorClient,
-		endpointListFunc, getTLSConfigFunc, endpointCheckDisabledFunc,
+		endpointListFunc, getTLSConfigFunc, getProxyFn, endpointCheckDisabledFunc,
 		informers,
 		recorder)
 }

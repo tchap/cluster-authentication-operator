@@ -21,10 +21,13 @@ import (
 	configsetterv1 "github.com/openshift/client-go/config/clientset/versioned/typed/config/v1"
 	configinformersv1 "github.com/openshift/client-go/config/informers/externalversions/config/v1"
 	configlistersv1 "github.com/openshift/client-go/config/listers/config/v1"
+	operatorv1informers "github.com/openshift/client-go/operator/informers/externalversions/operator/v1"
+	operatorv1listers "github.com/openshift/client-go/operator/listers/operator/v1"
 	routeclient "github.com/openshift/client-go/route/clientset/versioned/typed/route/v1"
 	routeinformer "github.com/openshift/client-go/route/informers/externalversions/route/v1"
 	routev1lister "github.com/openshift/client-go/route/listers/route/v1"
 	"github.com/openshift/library-go/pkg/controller/factory"
+	"github.com/openshift/library-go/pkg/operator/configobserver/featuregates"
 	"github.com/openshift/library-go/pkg/operator/events"
 	"github.com/openshift/library-go/pkg/operator/resource/resourcemerge"
 	"github.com/openshift/library-go/pkg/operator/resource/resourceread"
@@ -42,16 +45,19 @@ const (
 )
 
 type customRouteController struct {
-	destSecret        types.NamespacedName
-	componentRoute    types.NamespacedName
-	ingressLister     configlistersv1.IngressLister
-	ingressClient     configsetterv1.IngressInterface
-	routeLister       routev1lister.RouteLister
-	routeClient       routeclient.RouteInterface
-	secretLister      corev1listers.SecretLister
-	resourceSyncer    resourcesynccontroller.ResourceSyncer
-	operatorClient    v1helpers.OperatorClient
-	authConfigChecker common.AuthConfigChecker
+	destSecret          types.NamespacedName
+	componentRoute      types.NamespacedName
+	ingressLister       configlistersv1.IngressLister
+	ingressClient       configsetterv1.IngressInterface
+	routeLister         routev1lister.RouteLister
+	routeClient         routeclient.RouteInterface
+	secretLister        corev1listers.SecretLister
+	resourceSyncer      resourcesynccontroller.ResourceSyncer
+	operatorClient      v1helpers.OperatorClient
+	authConfigChecker   common.AuthConfigChecker
+	configMapLister     corev1listers.ConfigMapLister
+	operatorAuthLister  operatorv1listers.AuthenticationLister
+	featureGateAccessor featuregates.FeatureGateAccess
 }
 
 func NewCustomRouteController(
@@ -64,6 +70,8 @@ func NewCustomRouteController(
 	routeInformer routeinformer.RouteInformer,
 	routeClient routeclient.RouteInterface,
 	kubeInformersForNamespaces v1helpers.KubeInformersForNamespaces,
+	operatorAuthInformer operatorv1informers.AuthenticationInformer,
+	featureGateAccessor featuregates.FeatureGateAccess,
 	operatorClient v1helpers.OperatorClient,
 	authConfigChecker common.AuthConfigChecker,
 	eventRecorder events.Recorder,
@@ -78,14 +86,17 @@ func NewCustomRouteController(
 			Namespace: componentRouteNamespace,
 			Name:      componentRouteName,
 		},
-		ingressLister:     ingressInformer.Lister(),
-		ingressClient:     ingressClient,
-		routeLister:       routeInformer.Lister(),
-		routeClient:       routeClient,
-		secretLister:      kubeInformersForNamespaces.SecretLister(),
-		operatorClient:    operatorClient,
-		resourceSyncer:    resourceSyncer,
-		authConfigChecker: authConfigChecker,
+		ingressLister:       ingressInformer.Lister(),
+		ingressClient:       ingressClient,
+		routeLister:         routeInformer.Lister(),
+		routeClient:         routeClient,
+		secretLister:        kubeInformersForNamespaces.SecretLister(),
+		configMapLister:     kubeInformersForNamespaces.ConfigMapLister(),
+		operatorClient:      operatorClient,
+		resourceSyncer:      resourceSyncer,
+		authConfigChecker:   authConfigChecker,
+		operatorAuthLister:  operatorAuthInformer.Lister(),
+		featureGateAccessor: featureGateAccessor,
 	}
 
 	return factory.New().
@@ -94,6 +105,7 @@ func NewCustomRouteController(
 			routeInformer.Informer(),
 			kubeInformersForNamespaces.InformersFor("openshift-config").Core().V1().Secrets().Informer(),
 			kubeInformersForNamespaces.InformersFor("openshift-authentication").Core().V1().Secrets().Informer(),
+			operatorAuthInformer.Informer(),
 		).
 		WithInformers(common.AuthConfigCheckerInformers[factory.Informer](&authConfigChecker)...).
 		WithSyncDegradedOnError(operatorClient).
@@ -253,7 +265,11 @@ func (c *customRouteController) updateIngressConfigStatus(ctx context.Context, i
 	if newConditions == nil {
 		newConditions = checkIngressURI(ingressConfig, route)
 		if newConditions == nil {
-			newConditions = checkRouteAvailablity(c.secretLister, ingressConfig, route)
+			proxy, err := common.ResolveProxy(c.featureGateAccessor, c.operatorAuthLister)
+			if err != nil {
+				return err
+			}
+			newConditions = checkRouteAvailability(c.secretLister, c.configMapLister, ingressConfig, route, proxy)
 		}
 	}
 	newConditions = ensureDefaultConditions(newConditions)

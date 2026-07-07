@@ -19,8 +19,11 @@ import (
 	osinv1 "github.com/openshift/api/osin/v1"
 
 	"github.com/openshift/cluster-authentication-operator/pkg/operator/datasync"
-	"github.com/openshift/cluster-authentication-operator/pkg/transport"
 )
+
+// transportForCABuilderFunc builds an http.RoundTripper for a given CA ConfigMap
+// reference. The cmLister and any proxy settings are captured in the closure.
+type transportForCABuilderFunc func(caConfigMapName, key string) (http.RoundTripper, error)
 
 // field names are used to uniquely identify a secret or config map reference
 // within a given identity provider.  thus the same IDP cannot use the same field
@@ -54,16 +57,16 @@ type idpData struct {
 }
 
 func convertIdentityProviders(
-	cmLister corelistersv1.ConfigMapLister,
 	secretsLister corelistersv1.SecretLister,
 	identityProviders []configv1.IdentityProvider,
+	buildTransport transportForCABuilderFunc,
 ) ([]interface{}, *datasync.ConfigSyncData, []error) {
 	converted := []osinv1.IdentityProvider{}
 	syncData := datasync.NewConfigSyncData()
 	errs := []error{}
 
 	for i, idp := range defaultIDPMappingMethods(identityProviders) {
-		data, err := convertProviderConfigToIDPData(cmLister, secretsLister, &idp.IdentityProviderConfig, syncData, i)
+		data, err := convertProviderConfigToIDPData(secretsLister, &idp.IdentityProviderConfig, syncData, i, buildTransport)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("failed to apply IDP %s config: %v", idp.Name, err))
 			continue
@@ -111,11 +114,11 @@ func defaultIDPMappingMethods(identityProviders []configv1.IdentityProvider) []c
 }
 
 func convertProviderConfigToIDPData(
-	cmLister corelistersv1.ConfigMapLister,
 	secretsLister corelistersv1.SecretLister,
 	providerConfig *configv1.IdentityProviderConfig,
 	syncData *datasync.ConfigSyncData,
 	i int,
+	buildTransport transportForCABuilderFunc,
 ) (*idpData, error) {
 	const missingProviderFmt string = "type %s was specified, but its configuration is missing"
 
@@ -241,7 +244,7 @@ func convertProviderConfigToIDPData(
 			return nil, fmt.Errorf(missingProviderFmt, providerConfig.Type)
 		}
 
-		urls, err := discoverOpenIDURLs(cmLister, openIDConfig.Issuer, corev1.ServiceAccountRootCAKey, openIDConfig.CA)
+		urls, err := discoverOpenIDURLs(openIDConfig.Issuer, corev1.ServiceAccountRootCAKey, openIDConfig.CA, buildTransport)
 		if err != nil {
 			return nil, err
 		}
@@ -272,12 +275,12 @@ func convertProviderConfigToIDPData(
 		// challenge-redirecting IdPs to be configured with OIDC so it is safe
 		// to allow challenge-issuing flow if it's available on the OIDC side
 		challengeFlowsAllowed, err := checkOIDCPasswordGrantFlow(
-			cmLister,
 			secretsLister,
 			urls.Token,
 			openIDConfig.ClientID,
 			openIDConfig.CA,
 			openIDConfig.ClientSecret,
+			buildTransport,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("error attempting password grant flow: %v", err)
@@ -312,7 +315,7 @@ func convertProviderConfigToIDPData(
 
 // discoverOpenIDURLs retrieves basic information about an OIDC server with hostname
 // given by the `issuer` argument
-func discoverOpenIDURLs(cmLister corelistersv1.ConfigMapLister, issuer, key string, ca configv1.ConfigMapNameReference) (*osinv1.OpenIDURLs, error) {
+func discoverOpenIDURLs(issuer, key string, ca configv1.ConfigMapNameReference, buildTransport transportForCABuilderFunc) (*osinv1.OpenIDURLs, error) {
 	issuer = strings.TrimRight(issuer, "/") // TODO make impossible via validation and remove
 
 	wellKnown := issuer + "/.well-known/openid-configuration"
@@ -321,7 +324,7 @@ func discoverOpenIDURLs(cmLister corelistersv1.ConfigMapLister, issuer, key stri
 		return nil, err
 	}
 
-	rt, err := transport.TransportForCARef(cmLister, ca.Name, key)
+	rt, err := buildTransport(ca.Name, key)
 	if err != nil {
 		return nil, err
 	}
@@ -371,11 +374,11 @@ func discoverOpenIDURLs(cmLister corelistersv1.ConfigMapLister, issuer, key stri
 }
 
 func checkOIDCPasswordGrantFlow(
-	cmLister corelistersv1.ConfigMapLister,
 	secretsLister corelistersv1.SecretLister,
 	tokenURL, clientID string,
 	caRererence configv1.ConfigMapNameReference,
 	clientSecretReference configv1.SecretNameReference,
+	buildTransport transportForCABuilderFunc,
 ) (bool, error) {
 	secret, err := secretsLister.Secrets("openshift-config").Get(clientSecretReference.Name)
 	if err != nil {
@@ -394,7 +397,7 @@ func checkOIDCPasswordGrantFlow(
 		return false, fmt.Errorf("the referenced secret does not contain a value for the 'clientSecret' key")
 	}
 
-	transport, err := transport.TransportForCARef(cmLister, caRererence.Name, corev1.ServiceAccountRootCAKey)
+	rt, err := buildTransport(caRererence.Name, corev1.ServiceAccountRootCAKey)
 	if err != nil {
 		return false, fmt.Errorf("couldn't get a transport for the referenced CA: %v", err)
 	}
@@ -417,7 +420,7 @@ func checkOIDCPasswordGrantFlow(
 	// explicitly set Accept to 'application/json' as that's the expected deserializable output
 	req.Header.Set("Accept", "application/json")
 
-	client := &http.Client{Transport: transport}
+	client := &http.Client{Transport: rt}
 	resp, err := client.Do(req)
 	if err != nil {
 		return false, err

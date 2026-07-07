@@ -15,7 +15,10 @@ import (
 	clocktesting "k8s.io/utils/clock/testing"
 
 	configv1 "github.com/openshift/api/config/v1"
+	"github.com/openshift/api/features"
 	configlistersv1 "github.com/openshift/client-go/config/listers/config/v1"
+	operatorv1listers "github.com/openshift/client-go/operator/listers/operator/v1"
+	"github.com/openshift/library-go/pkg/operator/configobserver/featuregates"
 	"github.com/openshift/library-go/pkg/operator/events"
 	"github.com/openshift/library-go/pkg/operator/resourcesynccontroller"
 
@@ -195,11 +198,17 @@ func TestObserveIdentityProviders(t *testing.T) {
 			}
 
 			syncerData := tt.previousSyncerData
+			operatorAuthIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
 			listers := configobservation.Listers{
-				ConfigMapLister: corelistersv1.NewConfigMapLister(indexer),
-				SecretsLister:   corelistersv1.NewSecretLister(indexer),
-				OAuthLister_:    configlistersv1.NewOAuthLister(indexer),
-				ResourceSync:    &mockResourceSyncer{t: t, synced: syncerData},
+				ConfigMapLister:    corelistersv1.NewConfigMapLister(indexer),
+				SecretsLister:      corelistersv1.NewSecretLister(indexer),
+				OAuthLister_:       configlistersv1.NewOAuthLister(indexer),
+				ResourceSync:       &mockResourceSyncer{t: t, synced: syncerData},
+				OperatorAuthLister: operatorv1listers.NewAuthenticationLister(operatorAuthIndexer),
+				FeatureGateAccessor: featuregates.NewHardcodedFeatureGateAccess(
+					[]configv1.FeatureGateName{features.FeatureGateAuthenticationComponentProxy},
+					nil,
+				),
 			}
 			eventsRecorder := events.NewInMemoryRecorder(t.Name(), clocktesting.NewFakePassiveClock(time.Now()))
 
