@@ -164,7 +164,9 @@ func (p *proxyConfigChecker) validateComponentProxy(ctx context.Context, recorde
 
 	// Load component proxy CA if configured
 	if len(authProxy.TrustedCA.Name) > 0 {
-		if caCM, caErr := p.configMapLister.ConfigMaps("openshift-config").Get(authProxy.TrustedCA.Name); caErr == nil {
+		if caCM, caErr := p.configMapLister.ConfigMaps("openshift-config").Get(authProxy.TrustedCA.Name); caErr != nil {
+			klog.Warningf("failed to load component proxy CA configmap %q: %v", authProxy.TrustedCA.Name, caErr)
+		} else {
 			caPool.AppendCertsFromPEM([]byte(caCM.Data["ca-bundle.crt"]))
 		}
 	}

@@ -66,7 +66,9 @@ func ObserveIdentityProviders(genericlisters configobserver.Listers, recorder ev
 		httpProxy, httpsProxy, noProxy := common.ResolveProxyConfig(authProxy, nil)
 		var proxyCAData []byte
 		if len(authProxy.TrustedCA.Name) > 0 {
-			if caCM, caErr := listers.ConfigMapLister.ConfigMaps("openshift-config").Get(authProxy.TrustedCA.Name); caErr == nil {
+			if caCM, caErr := listers.ConfigMapLister.ConfigMaps("openshift-config").Get(authProxy.TrustedCA.Name); caErr != nil {
+				klog.Warningf("failed to load component proxy CA configmap %q: %v", authProxy.TrustedCA.Name, caErr)
+			} else {
 				proxyCAData = []byte(caCM.Data["ca-bundle.crt"])
 			}
 		}
