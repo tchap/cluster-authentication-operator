@@ -18,6 +18,8 @@ import (
 	operatorv1 "github.com/openshift/api/operator/v1"
 	operatorv1listers "github.com/openshift/client-go/operator/listers/operator/v1"
 	"github.com/openshift/library-go/pkg/operator/configobserver/featuregates"
+
+	"github.com/openshift/cluster-authentication-operator/pkg/internal/transporttest"
 )
 
 var (
@@ -236,8 +238,8 @@ func TestResolvedProxy_IsProxyConfigured(t *testing.T) {
 }
 
 func TestResolvedProxy_ProxyFunc(t *testing.T) {
-	httpsURL := mustParseURL(t, "https://idp.example.com/.well-known/openid-configuration")
-	httpURL := mustParseURL(t, "http://idp.example.com/callback")
+	httpsURL := transporttest.MustParseURL(t, "https://idp.example.com/.well-known/openid-configuration")
+	httpURL := transporttest.MustParseURL(t, "http://idp.example.com/callback")
 
 	tests := []struct {
 		name         string
@@ -335,15 +337,6 @@ func TestResolvedProxy_ProxyFunc(t *testing.T) {
 			}
 		})
 	}
-}
-
-func mustParseURL(t *testing.T, raw string) *url.URL {
-	t.Helper()
-	u, err := url.Parse(raw)
-	if err != nil {
-		t.Fatalf("failed to parse URL %q: %v", raw, err)
-	}
-	return u
 }
 
 func TestResolveProxy_FeatureGateError(t *testing.T) {

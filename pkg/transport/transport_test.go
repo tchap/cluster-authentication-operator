@@ -4,8 +4,6 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"net/http"
-	"net/url"
-	"path"
 	"testing"
 	"time"
 
@@ -17,12 +15,12 @@ import (
 	corelistersv1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 
-	"github.com/openshift/library-go/pkg/crypto"
+	"github.com/openshift/cluster-authentication-operator/pkg/internal/transporttest"
 )
 
 func TestTransportForCARef(t *testing.T) {
-	_, caPEM := makeSelfSignedCA(t)
-	_, extraPEM := makeSelfSignedCA(t)
+	_, caPEM := transporttest.MakeSelfSignedCA(t)
+	_, extraPEM := transporttest.MakeSelfSignedCA(t)
 	emptyLister := newConfigMapLister()
 
 	ref := func(name, key string) CAReference { return CAReference{ConfigMapName: name, ConfigMapKey: key} }
@@ -42,7 +40,7 @@ func TestTransportForCARef(t *testing.T) {
 		rt, err := TransportForCARef(lister, []CAReference{ref("my-ca", "ca-bundle.crt")}, "", "", "")
 		require.NoError(t, err)
 
-		tr := unwrapTransport(t, rt)
+		tr := transporttest.UnwrapTransport(t, rt)
 		requirePoolContains(t, rootCAs(t, tr), caPEM)
 	})
 
@@ -79,7 +77,7 @@ func TestTransportForCARef(t *testing.T) {
 		}, "", "", "")
 		require.NoError(t, err)
 
-		tr := unwrapTransport(t, rt)
+		tr := transporttest.UnwrapTransport(t, rt)
 		requirePoolContains(t, rootCAs(t, tr), caPEM, extraPEM)
 	})
 
@@ -92,7 +90,7 @@ func TestTransportForCARef(t *testing.T) {
 		rt, err := TransportForCARef(lister, []CAReference{ref("binary-ca", "ca-bundle.crt")}, "", "", "")
 		require.NoError(t, err)
 
-		tr := unwrapTransport(t, rt)
+		tr := transporttest.UnwrapTransport(t, rt)
 		requirePoolContains(t, rootCAs(t, tr), caPEM)
 	})
 
@@ -101,14 +99,14 @@ func TestTransportForCARef(t *testing.T) {
 			"http://proxy.example.com:8080", "", "")
 		require.NoError(t, err)
 
-		tr := unwrapTransport(t, rt)
+		tr := transporttest.UnwrapTransport(t, rt)
 		require.NotNil(t, tr.Proxy)
 
-		proxyURL, err := tr.Proxy(&http.Request{URL: mustParseURL(t, "http://target.example.com")})
+		proxyURL, err := tr.Proxy(&http.Request{URL: transporttest.MustParseURL(t, "http://target.example.com")})
 		require.NoError(t, err)
 		require.Equal(t, "http://proxy.example.com:8080", proxyURL.String())
 
-		proxyURL, err = tr.Proxy(&http.Request{URL: mustParseURL(t, "https://target.example.com")})
+		proxyURL, err = tr.Proxy(&http.Request{URL: transporttest.MustParseURL(t, "https://target.example.com")})
 		require.NoError(t, err)
 		require.Nil(t, proxyURL, "HTTPS request should not use HTTP proxy")
 	})
@@ -118,14 +116,14 @@ func TestTransportForCARef(t *testing.T) {
 			"", "https://secure-proxy.example.com:443", "")
 		require.NoError(t, err)
 
-		tr := unwrapTransport(t, rt)
+		tr := transporttest.UnwrapTransport(t, rt)
 		require.NotNil(t, tr.Proxy)
 
-		proxyURL, err := tr.Proxy(&http.Request{URL: mustParseURL(t, "https://target.example.com")})
+		proxyURL, err := tr.Proxy(&http.Request{URL: transporttest.MustParseURL(t, "https://target.example.com")})
 		require.NoError(t, err)
 		require.Equal(t, "https://secure-proxy.example.com:443", proxyURL.String())
 
-		proxyURL, err = tr.Proxy(&http.Request{URL: mustParseURL(t, "http://target.example.com")})
+		proxyURL, err = tr.Proxy(&http.Request{URL: transporttest.MustParseURL(t, "http://target.example.com")})
 		require.NoError(t, err)
 		require.Nil(t, proxyURL, "HTTP request should not use HTTPS proxy")
 	})
@@ -136,14 +134,14 @@ func TestTransportForCARef(t *testing.T) {
 			"noproxy.example.com")
 		require.NoError(t, err)
 
-		tr := unwrapTransport(t, rt)
+		tr := transporttest.UnwrapTransport(t, rt)
 		require.NotNil(t, tr.Proxy)
 
-		proxyURL, err := tr.Proxy(&http.Request{URL: mustParseURL(t, "http://noproxy.example.com/path")})
+		proxyURL, err := tr.Proxy(&http.Request{URL: transporttest.MustParseURL(t, "http://noproxy.example.com/path")})
 		require.NoError(t, err)
 		require.Nil(t, proxyURL, "request matching noProxy should not be proxied")
 
-		proxyURL, err = tr.Proxy(&http.Request{URL: mustParseURL(t, "http://other.example.com/path")})
+		proxyURL, err = tr.Proxy(&http.Request{URL: transporttest.MustParseURL(t, "http://other.example.com/path")})
 		require.NoError(t, err)
 		require.NotNil(t, proxyURL, "request not matching noProxy should be proxied")
 	})
@@ -166,14 +164,14 @@ func TestTransportForCARef(t *testing.T) {
 		}, "http://proxy.example.com:8080", "", "")
 		require.NoError(t, err)
 
-		tr := unwrapTransport(t, rt)
+		tr := transporttest.UnwrapTransport(t, rt)
 		require.NotNil(t, tr.Proxy)
 		requirePoolContains(t, rootCAs(t, tr), caPEM, extraPEM)
 	})
 }
 
 func TestNewTransport(t *testing.T) {
-	_, caPEM := makeSelfSignedCA(t)
+	_, caPEM := transporttest.MakeSelfSignedCA(t)
 
 	t.Run("nil caData returns transport without RootCAs", func(t *testing.T) {
 		tr, err := newTransport("", nil, nil, nil)
@@ -205,7 +203,7 @@ func TestNewTransport(t *testing.T) {
 	})
 
 	t.Run("valid cert and key pair is loaded", func(t *testing.T) {
-		ca, _ := makeSelfSignedCA(t)
+		ca, _ := transporttest.MakeSelfSignedCA(t)
 
 		clientCfg, err := ca.MakeClientCertificateForDuration(&user.DefaultInfo{Name: "test-client"}, time.Hour)
 		require.NoError(t, err)
@@ -302,41 +300,12 @@ func TestLoadCAData(t *testing.T) {
 	}
 }
 
-func makeSelfSignedCA(t *testing.T) (*crypto.CA, []byte) {
-	t.Helper()
-	tmpDir := t.TempDir()
-	ca, err := crypto.MakeSelfSignedCA(
-		path.Join(tmpDir, "ca.crt"),
-		path.Join(tmpDir, "ca.key"),
-		"", "testCA", time.Hour*24,
-	)
-	require.NoError(t, err)
-	certPEM, _, err := ca.Config.GetPEMBytes()
-	require.NoError(t, err)
-	return ca, certPEM
-}
-
 func newConfigMapLister(cms ...*corev1.ConfigMap) corelistersv1.ConfigMapLister {
 	indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
 	for _, cm := range cms {
 		_ = indexer.Add(cm)
 	}
 	return corelistersv1.NewConfigMapLister(indexer)
-}
-
-func unwrapTransport(t *testing.T, rt http.RoundTripper) *http.Transport {
-	t.Helper()
-	type unwrapper interface {
-		WrappedRoundTripper() http.RoundTripper
-	}
-	for {
-		if tr, ok := rt.(*http.Transport); ok {
-			return tr
-		}
-		u, ok := rt.(unwrapper)
-		require.True(t, ok, "cannot unwrap %T to *http.Transport", rt)
-		rt = u.WrappedRoundTripper()
-	}
 }
 
 func rootCAs(t *testing.T, tr *http.Transport) *x509.CertPool {
@@ -363,11 +332,4 @@ func mustCertFromPEM(t *testing.T, data []byte) *x509.Certificate {
 	cert, err := x509.ParseCertificate(block.Bytes)
 	require.NoError(t, err)
 	return cert
-}
-
-func mustParseURL(t *testing.T, rawURL string) *url.URL {
-	t.Helper()
-	u, err := url.Parse(rawURL)
-	require.NoError(t, err)
-	return u
 }

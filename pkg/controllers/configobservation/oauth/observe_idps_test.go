@@ -2,10 +2,12 @@ package oauth
 
 import (
 	"fmt"
+	"net/http"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/stretchr/testify/require"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
@@ -16,6 +18,7 @@ import (
 
 	configv1 "github.com/openshift/api/config/v1"
 	"github.com/openshift/api/features"
+	operatorv1 "github.com/openshift/api/operator/v1"
 	configlistersv1 "github.com/openshift/client-go/config/listers/config/v1"
 	operatorv1listers "github.com/openshift/client-go/operator/listers/operator/v1"
 	"github.com/openshift/library-go/pkg/operator/configobserver/featuregates"
@@ -23,6 +26,7 @@ import (
 	"github.com/openshift/library-go/pkg/operator/resourcesynccontroller"
 
 	"github.com/openshift/cluster-authentication-operator/pkg/controllers/configobservation"
+	"github.com/openshift/cluster-authentication-operator/pkg/internal/transporttest"
 )
 
 type mockResourceSyncer struct {
@@ -230,6 +234,57 @@ func TestObserveIdentityProviders(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestBuildIDPTransport verifies that when the feature gate is enabled and the
+// Authentication CR has a component proxy with a trusted CA, the transport
+// builder wires the proxy function and loads the CA into the transport.
+func TestBuildIDPTransport(t *testing.T) {
+	_, caPEM := transporttest.MakeSelfSignedCA(t)
+	proxyCA := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-proxy-ca", Namespace: "openshift-config"},
+		Data:       map[string]string{"ca-bundle.crt": string(caPEM)},
+	}
+	authCR := &operatorv1.Authentication{
+		ObjectMeta: metav1.ObjectMeta{Name: "cluster"},
+		Spec: operatorv1.AuthenticationSpec{
+			Proxy: operatorv1.AuthenticationProxyConfig{
+				HTTPSProxy: "http://proxy:3128",
+				TrustedCA:  operatorv1.AuthenticationConfigMapReference{Name: "my-proxy-ca"},
+			},
+		},
+	}
+
+	cmIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	require.NoError(t, cmIndexer.Add(proxyCA))
+
+	authIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	require.NoError(t, authIndexer.Add(authCR))
+
+	listers := configobservation.Listers{
+		ConfigMapLister:    corelistersv1.NewConfigMapLister(cmIndexer),
+		OperatorAuthLister: operatorv1listers.NewAuthenticationLister(authIndexer),
+		FeatureGateAccessor: featuregates.NewHardcodedFeatureGateAccess(
+			[]configv1.FeatureGateName{features.FeatureGateAuthenticationComponentProxy},
+			nil,
+		),
+	}
+
+	buildTransport, err := buildIDPTransport(listers)
+	require.NoError(t, err)
+
+	// Call without an IdP CA — should still succeed because the proxy CA is loaded.
+	rt, err := buildTransport("", "")
+	require.NoError(t, err)
+
+	tr := transporttest.UnwrapTransport(t, rt)
+	require.NotNil(t, tr.Proxy, "transport should have a proxy function set")
+
+	// Verify proxy is wired: an HTTPS request should be proxied.
+	proxyURL, err := tr.Proxy(&http.Request{URL: transporttest.MustParseURL(t, "https://idp.example.com")})
+	require.NoError(t, err)
+	require.NotNil(t, proxyURL)
+	require.Equal(t, "http://proxy:3128", proxyURL.String())
 }
 
 func eventsReasonMessage(e []*corev1.Event) []string {

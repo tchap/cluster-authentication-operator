@@ -90,17 +90,6 @@ func Test_checkProxyConfig(t *testing.T) {
 	}
 }
 
-type workingHTTPRoundTripper struct{}
-type faultyHTTPRoundTripper struct{}
-
-func (s *workingHTTPRoundTripper) RoundTrip(_ *http.Request) (*http.Response, error) {
-	return &http.Response{StatusCode: 200}, nil
-}
-
-func (s *faultyHTTPRoundTripper) RoundTrip(_ *http.Request) (*http.Response, error) {
-	return &http.Response{StatusCode: 404}, nil
-}
-
 func Test_extractIdPURLs(t *testing.T) {
 	tests := []struct {
 		name string
@@ -323,4 +312,72 @@ func Test_validateIdPConnectivity(t *testing.T) {
 			}
 		})
 	}
+}
+
+func Test_validateIdPConnectivity_hashDedup(t *testing.T) {
+	idps := []configv1.IdentityProvider{{
+		IdentityProviderConfig: configv1.IdentityProviderConfig{
+			Type:   configv1.IdentityProviderTypeGitLab,
+			GitLab: &configv1.GitLabIdentityProvider{URL: "https://gitlab.example.com"},
+		},
+	}}
+	oauthConfig := &configv1.OAuth{
+		ObjectMeta: metav1.ObjectMeta{Name: "cluster"},
+		Spec:       configv1.OAuthSpec{IdentityProviders: idps},
+	}
+	indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	if err := indexer.Add(oauthConfig); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("second call with same config skips validation", func(t *testing.T) {
+		recorder := events.NewInMemoryRecorder(t.Name(), clocktesting.NewFakePassiveClock(time.Now()))
+		p := &proxyConfigChecker{
+			oauthLister: configv1listers.NewOAuthLister(indexer),
+		}
+
+		reachable := &http.Client{Transport: &workingHTTPRoundTripper{}}
+		p.validateIdPConnectivity(context.Background(), recorder, reachable, "http://proxy:3128", "", "")
+		if len(recorder.Events()) != 0 {
+			t.Fatalf("first call should emit no events for reachable endpoints, got %d", len(recorder.Events()))
+		}
+
+		followupRecorder := events.NewInMemoryRecorder(t.Name(), clocktesting.NewFakePassiveClock(time.Now()))
+		unreachable := &http.Client{Transport: &faultyHTTPRoundTripper{}}
+		p.validateIdPConnectivity(context.Background(), followupRecorder, unreachable, "http://proxy:3128", "", "")
+		if len(followupRecorder.Events()) != 0 {
+			t.Fatalf("second call with same config should skip validation, got %d events", len(followupRecorder.Events()))
+		}
+	})
+
+	t.Run("hash not saved on failure allows retry", func(t *testing.T) {
+		recorder := events.NewInMemoryRecorder(t.Name(), clocktesting.NewFakePassiveClock(time.Now()))
+		p := &proxyConfigChecker{
+			oauthLister: configv1listers.NewOAuthLister(indexer),
+		}
+
+		unreachable := &http.Client{Transport: &faultyHTTPRoundTripper{}}
+		p.validateIdPConnectivity(context.Background(), recorder, unreachable, "http://proxy:3128", "", "")
+		if len(recorder.Events()) != 1 {
+			t.Fatalf("expected 1 event on failure, got %d", len(recorder.Events()))
+		}
+
+		followupRecorder := events.NewInMemoryRecorder(t.Name(), clocktesting.NewFakePassiveClock(time.Now()))
+		p.validateIdPConnectivity(context.Background(), followupRecorder, unreachable, "http://proxy:3128", "", "")
+		if len(followupRecorder.Events()) != 1 {
+			t.Fatalf("expected 1 event on retry after failure, got %d", len(followupRecorder.Events()))
+		}
+	})
+}
+
+type workingHTTPRoundTripper struct{}
+
+func (s *workingHTTPRoundTripper) RoundTrip(_ *http.Request) (*http.Response, error) {
+	return &http.Response{StatusCode: 200}, nil
+}
+
+type faultyHTTPRoundTripper struct{}
+
+func (s *faultyHTTPRoundTripper) RoundTrip(_ *http.Request) (*http.Response, error) {
+	return &http.Response{StatusCode: 404}, nil
 }
