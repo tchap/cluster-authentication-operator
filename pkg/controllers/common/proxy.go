@@ -2,6 +2,7 @@ package common
 
 import (
 	"fmt"
+	"os"
 	"strings"
 
 	"golang.org/x/net/http/httpproxy"
@@ -93,8 +94,16 @@ func getComponentProxyConfig(
 
 // staticNoProxyEntries contains cluster-internal addresses that must bypass the
 // proxy. Auth components connect to internal services via DNS names covered by
-// .svc and .cluster.local, so network CIDRs and api-int hostname are not needed.
-var staticNoProxyEntries = []string{".cluster.local", ".svc", "127.0.0.1", "localhost"}
+// .svc and .cluster.local. The kubernetes API service IP (KUBERNETES_SERVICE_HOST)
+// is included explicitly because Go's in-cluster client connects to it by raw IP,
+// which does not match the hostname-based entries above.
+var staticNoProxyEntries = func() []string {
+	entries := []string{".cluster.local", ".svc", "127.0.0.1", "localhost"}
+	if host := os.Getenv("KUBERNETES_SERVICE_HOST"); host != "" {
+		entries = append(entries, host)
+	}
+	return entries
+}()
 
 // mergeNoProxy combines user-provided noProxy entries with static cluster-internal
 // defaults. The result is deduplicated and sorted for deterministic output.
