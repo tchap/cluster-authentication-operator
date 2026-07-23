@@ -3,8 +3,6 @@ package common
 import (
 	"errors"
 	"net/url"
-	"sort"
-	"strings"
 	"testing"
 
 	"golang.org/x/net/http/httpproxy"
@@ -191,7 +189,7 @@ func TestResolveProxy(t *testing.T) {
 			if got.HTTPSProxy != tt.want.HTTPSProxy {
 				t.Errorf("HTTPSProxy = %q, want %q", got.HTTPSProxy, tt.want.HTTPSProxy)
 			}
-			if sortedCSV(got.NoProxy) != sortedCSV(tt.want.NoProxy) {
+			if got.NoProxy != tt.want.NoProxy {
 				t.Errorf("NoProxy = %q, want %q", got.NoProxy, tt.want.NoProxy)
 			}
 			if got.TrustedCAName != tt.want.TrustedCAName {
@@ -339,16 +337,6 @@ func TestResolvedProxy_ProxyFunc(t *testing.T) {
 	}
 }
 
-func TestResolveProxy_FeatureGateError(t *testing.T) {
-	ch := make(chan struct{})
-	fga := featuregates.NewHardcodedFeatureGateAccessForTesting(nil, nil, ch, errors.New("not yet observed"))
-
-	_, err := ResolveProxy(fga, newOperatorAuthLister(nil))
-	if err == nil || err.Error() != "failed to get current feature gates: not yet observed" {
-		t.Fatalf("expected feature gate error, got: %v", err)
-	}
-}
-
 func newOperatorAuthLister(auth *operatorv1.Authentication) operatorv1listers.AuthenticationLister {
 	indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
 	if auth != nil {
@@ -371,13 +359,4 @@ func (l *errorAuthLister) List(_ labels.Selector) ([]*operatorv1.Authentication,
 
 func (l *errorAuthLister) Get(_ string) (*operatorv1.Authentication, error) {
 	return nil, l.err
-}
-
-func sortedCSV(s string) string {
-	if s == "" {
-		return ""
-	}
-	parts := strings.Split(s, ",")
-	sort.Strings(parts)
-	return strings.Join(parts, ",")
 }

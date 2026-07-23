@@ -97,9 +97,9 @@ func getComponentProxyConfig(
 var staticNoProxyEntries = []string{".cluster.local", ".svc", "127.0.0.1", "localhost"}
 
 // mergeNoProxy combines user-provided noProxy entries with static cluster-internal
-// defaults. It performs deduplication, but the items are not sorted.
+// defaults. The result is deduplicated and sorted for deterministic output.
 func mergeNoProxy(userNoProxy []string) string {
 	entries := sets.New[string](staticNoProxyEntries...)
 	entries.Insert(userNoProxy...)
-	return strings.Join(entries.UnsortedList(), ",")
+	return strings.Join(sets.List(entries), ",")
 }
