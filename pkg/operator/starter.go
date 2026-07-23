@@ -307,6 +307,7 @@ func prepareOauthOperator(
 		authOperatorInput.authenticationOperatorClient,
 		informerFactories.kubeInformersForNamespaces.InformersFor("openshift-authentication"),
 		informerFactories.kubeInformersForNamespaces.InformersFor("openshift-config-managed"),
+		informerFactories.kubeInformersForNamespaces.InformersFor("openshift-config"),
 		informerFactories.namespacedOpenshiftAuthenticationRoutes.Route().V1().Routes(),
 		informerFactories.operatorConfigInformer.Config().V1().Ingresses(),
 		informerFactories.operatorInformer.Operator().V1().Authentications(),
