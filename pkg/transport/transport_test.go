@@ -1,9 +1,7 @@
 package transport
 
 import (
-	"crypto/x509"
 	"encoding/pem"
-	"net/http"
 	"testing"
 	"time"
 
@@ -18,185 +16,33 @@ import (
 	"github.com/openshift/cluster-authentication-operator/pkg/internal/transporttest"
 )
 
-func TestTransportForCARef(t *testing.T) {
-	_, caPEM := transporttest.MakeSelfSignedCA(t)
-	_, extraPEM := transporttest.MakeSelfSignedCA(t)
-	emptyLister := newConfigMapLister()
-
-	ref := func(name, key string) CAReference { return CAReference{ConfigMapName: name, ConfigMapKey: key} }
-
-	t.Run("no refs no proxy returns default transport", func(t *testing.T) {
-		rt, err := TransportForCARef(emptyLister, nil, "", "", "")
-		require.NoError(t, err)
-		require.NotNil(t, rt)
-	})
-
-	t.Run("single CA ref is loaded into TLS root CAs", func(t *testing.T) {
-		lister := newConfigMapLister(&corev1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{Name: "my-ca", Namespace: "openshift-config"},
-			Data:       map[string]string{"ca-bundle.crt": string(caPEM)},
-		})
-
-		rt, err := TransportForCARef(lister, []CAReference{ref("my-ca", "ca-bundle.crt")}, "", "", "")
-		require.NoError(t, err)
-
-		tr := transporttest.UnwrapTransport(t, rt)
-		requirePoolContains(t, rootCAs(t, tr), caPEM)
-	})
-
-	t.Run("configmap not found returns error", func(t *testing.T) {
-		_, err := TransportForCARef(emptyLister, []CAReference{ref("missing-cm", "ca-bundle.crt")}, "", "", "")
-		require.ErrorContains(t, err, `"missing-cm" not found`)
-	})
-
-	t.Run("configmap with empty key returns error", func(t *testing.T) {
-		lister := newConfigMapLister(&corev1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{Name: "empty-ca", Namespace: "openshift-config"},
-			Data:       map[string]string{},
-		})
-
-		_, err := TransportForCARef(lister, []CAReference{ref("empty-ca", "ca-bundle.crt")}, "", "", "")
-		require.ErrorContains(t, err, `has no CA data at key "ca-bundle.crt"`)
-	})
-
-	t.Run("multiple CA refs are all loaded", func(t *testing.T) {
-		lister := newConfigMapLister(
-			&corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{Name: "ca-1", Namespace: "openshift-config"},
-				Data:       map[string]string{"ca-bundle.crt": string(caPEM)},
-			},
-			&corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{Name: "ca-2", Namespace: "openshift-config"},
-				Data:       map[string]string{"ca-bundle.crt": string(extraPEM)},
-			},
-		)
-
-		rt, err := TransportForCARef(lister, []CAReference{
-			ref("ca-1", "ca-bundle.crt"),
-			ref("ca-2", "ca-bundle.crt"),
-		}, "", "", "")
-		require.NoError(t, err)
-
-		tr := transporttest.UnwrapTransport(t, rt)
-		requirePoolContains(t, rootCAs(t, tr), caPEM, extraPEM)
-	})
-
-	t.Run("BinaryData key is used when Data key is absent", func(t *testing.T) {
-		lister := newConfigMapLister(&corev1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{Name: "binary-ca", Namespace: "openshift-config"},
-			BinaryData: map[string][]byte{"ca-bundle.crt": caPEM},
-		})
-
-		rt, err := TransportForCARef(lister, []CAReference{ref("binary-ca", "ca-bundle.crt")}, "", "", "")
-		require.NoError(t, err)
-
-		tr := transporttest.UnwrapTransport(t, rt)
-		requirePoolContains(t, rootCAs(t, tr), caPEM)
-	})
-
-	t.Run("HTTP proxy is set on transport", func(t *testing.T) {
-		rt, err := TransportForCARef(emptyLister, nil,
-			"http://proxy.example.com:8080", "", "")
-		require.NoError(t, err)
-
-		tr := transporttest.UnwrapTransport(t, rt)
-		require.NotNil(t, tr.Proxy)
-
-		proxyURL, err := tr.Proxy(&http.Request{URL: transporttest.MustParseURL(t, "http://target.example.com")})
-		require.NoError(t, err)
-		require.Equal(t, "http://proxy.example.com:8080", proxyURL.String())
-
-		proxyURL, err = tr.Proxy(&http.Request{URL: transporttest.MustParseURL(t, "https://target.example.com")})
-		require.NoError(t, err)
-		require.Nil(t, proxyURL, "HTTPS request should not use HTTP proxy")
-	})
-
-	t.Run("HTTPS proxy is set on transport", func(t *testing.T) {
-		rt, err := TransportForCARef(emptyLister, nil,
-			"", "https://secure-proxy.example.com:443", "")
-		require.NoError(t, err)
-
-		tr := transporttest.UnwrapTransport(t, rt)
-		require.NotNil(t, tr.Proxy)
-
-		proxyURL, err := tr.Proxy(&http.Request{URL: transporttest.MustParseURL(t, "https://target.example.com")})
-		require.NoError(t, err)
-		require.Equal(t, "https://secure-proxy.example.com:443", proxyURL.String())
-
-		proxyURL, err = tr.Proxy(&http.Request{URL: transporttest.MustParseURL(t, "http://target.example.com")})
-		require.NoError(t, err)
-		require.Nil(t, proxyURL, "HTTP request should not use HTTPS proxy")
-	})
-
-	t.Run("noProxy excludes matching hosts from proxy", func(t *testing.T) {
-		rt, err := TransportForCARef(emptyLister, nil,
-			"http://proxy.example.com:8080", "http://proxy.example.com:8080",
-			"noproxy.example.com")
-		require.NoError(t, err)
-
-		tr := transporttest.UnwrapTransport(t, rt)
-		require.NotNil(t, tr.Proxy)
-
-		proxyURL, err := tr.Proxy(&http.Request{URL: transporttest.MustParseURL(t, "http://noproxy.example.com/path")})
-		require.NoError(t, err)
-		require.Nil(t, proxyURL, "request matching noProxy should not be proxied")
-
-		proxyURL, err = tr.Proxy(&http.Request{URL: transporttest.MustParseURL(t, "http://other.example.com/path")})
-		require.NoError(t, err)
-		require.NotNil(t, proxyURL, "request not matching noProxy should be proxied")
-	})
-
-	t.Run("proxy with multiple CA refs", func(t *testing.T) {
-		lister := newConfigMapLister(
-			&corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{Name: "idp-ca", Namespace: "openshift-config"},
-				Data:       map[string]string{"ca-bundle.crt": string(caPEM)},
-			},
-			&corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{Name: "proxy-ca", Namespace: "openshift-config"},
-				Data:       map[string]string{"ca-bundle.crt": string(extraPEM)},
-			},
-		)
-
-		rt, err := TransportForCARef(lister, []CAReference{
-			ref("idp-ca", "ca-bundle.crt"),
-			ref("proxy-ca", "ca-bundle.crt"),
-		}, "http://proxy.example.com:8080", "", "")
-		require.NoError(t, err)
-
-		tr := transporttest.UnwrapTransport(t, rt)
-		require.NotNil(t, tr.Proxy)
-		requirePoolContains(t, rootCAs(t, tr), caPEM, extraPEM)
-	})
-}
-
 func TestNewTransport(t *testing.T) {
 	_, caPEM := transporttest.MakeSelfSignedCA(t)
 
 	t.Run("nil caData returns transport without RootCAs", func(t *testing.T) {
-		tr, err := newTransport("", nil, nil, nil)
+		tr, err := NewTransport("", nil, nil, nil)
 		require.NoError(t, err)
-		require.Nil(t, rootCAs(t, tr))
+		require.Nil(t, transporttest.RootCAs(t, tr))
 	})
 
 	t.Run("cert without key returns error", func(t *testing.T) {
-		_, err := newTransport("", nil, []byte("cert"), nil)
+		_, err := NewTransport("", nil, []byte("cert"), nil)
 		require.ErrorContains(t, err, "cert and key data must be specified together")
 	})
 
 	t.Run("key without cert returns error", func(t *testing.T) {
-		_, err := newTransport("", nil, nil, []byte("key"))
+		_, err := NewTransport("", nil, nil, []byte("key"))
 		require.ErrorContains(t, err, "cert and key data must be specified together")
 	})
 
 	t.Run("valid CA configures RootCAs", func(t *testing.T) {
-		tr, err := newTransport("", caPEM, nil, nil)
+		tr, err := NewTransport("", caPEM, nil, nil)
 		require.NoError(t, err)
-		requirePoolContains(t, rootCAs(t, tr), caPEM)
+		transporttest.RequirePoolContains(t, transporttest.RootCAs(t, tr), caPEM)
 	})
 
 	t.Run("server name is propagated", func(t *testing.T) {
-		tr, err := newTransport("my-server", nil, nil, nil)
+		tr, err := NewTransport("my-server", nil, nil, nil)
 		require.NoError(t, err)
 		require.NotNil(t, tr.TLSClientConfig)
 		require.Equal(t, "my-server", tr.TLSClientConfig.ServerName)
@@ -211,7 +57,7 @@ func TestNewTransport(t *testing.T) {
 		certPEM, keyPEM, err := clientCfg.GetPEMBytes()
 		require.NoError(t, err)
 
-		tr, err := newTransport("", nil, certPEM, keyPEM)
+		tr, err := NewTransport("", nil, certPEM, keyPEM)
 		require.NoError(t, err)
 		require.NotNil(t, tr.TLSClientConfig)
 		require.Len(t, tr.TLSClientConfig.Certificates, 1)
@@ -222,7 +68,7 @@ func TestNewTransport(t *testing.T) {
 	})
 
 	t.Run("invalid cert and key pair returns error", func(t *testing.T) {
-		_, err := newTransport("", nil, []byte("bad-cert"), []byte("bad-key"))
+		_, err := NewTransport("", nil, []byte("bad-cert"), []byte("bad-key"))
 		require.ErrorContains(t, err, "error loading x509 keypair from cert and key data")
 	})
 }
@@ -306,30 +152,4 @@ func newConfigMapLister(cms ...*corev1.ConfigMap) corelistersv1.ConfigMapLister 
 		_ = indexer.Add(cm)
 	}
 	return corelistersv1.NewConfigMapLister(indexer)
-}
-
-func rootCAs(t *testing.T, tr *http.Transport) *x509.CertPool {
-	t.Helper()
-	require.NotNil(t, tr.TLSClientConfig)
-	return tr.TLSClientConfig.RootCAs
-}
-
-func requirePoolContains(t *testing.T, pool *x509.CertPool, pemData ...[]byte) {
-	t.Helper()
-	require.NotNil(t, pool)
-	opts := x509.VerifyOptions{Roots: pool}
-	for _, p := range pemData {
-		cert := mustCertFromPEM(t, p)
-		_, err := cert.Verify(opts)
-		require.NoError(t, err)
-	}
-}
-
-func mustCertFromPEM(t *testing.T, data []byte) *x509.Certificate {
-	t.Helper()
-	block, _ := pem.Decode(data)
-	require.NotNil(t, block, "no PEM block found")
-	cert, err := x509.ParseCertificate(block.Bytes)
-	require.NoError(t, err)
-	return cert
 }

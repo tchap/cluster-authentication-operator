@@ -7,7 +7,6 @@ import (
 	"github.com/openshift/library-go/pkg/operator/configobserver"
 	"github.com/openshift/library-go/pkg/operator/events"
 
-	"github.com/openshift/cluster-authentication-operator/pkg/controllers/common"
 	"github.com/openshift/cluster-authentication-operator/pkg/controllers/configobservation"
 )
 
@@ -32,7 +31,7 @@ func ObserveComponentProxyTrustedCA(genericListers configobserver.Listers, recor
 		return existingConfig, []error{err}
 	}
 
-	proxy, err := common.ResolveProxy(listers.FeatureGateAccessor, listers.OperatorAuthLister)
+	proxy, err := listers.ProxyResolver.ResolveProxy()
 	if err != nil {
 		return existingConfig, []error{err}
 	}

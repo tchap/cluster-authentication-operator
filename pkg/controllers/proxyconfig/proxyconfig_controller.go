@@ -3,7 +3,6 @@ package proxyconfig
 import (
 	"context"
 	"crypto/sha256"
-	"crypto/tls"
 	"crypto/x509"
 	"fmt"
 	"net/http"
@@ -17,18 +16,14 @@ import (
 
 	configv1 "github.com/openshift/api/config/v1"
 	configv1listers "github.com/openshift/client-go/config/listers/config/v1"
-	operatorv1informers "github.com/openshift/client-go/operator/informers/externalversions/operator/v1"
-	operatorv1listers "github.com/openshift/client-go/operator/listers/operator/v1"
 	routeinformer "github.com/openshift/client-go/route/informers/externalversions/route/v1"
 	v1 "github.com/openshift/client-go/route/listers/route/v1"
 	"github.com/openshift/library-go/pkg/controller/factory"
-	"github.com/openshift/library-go/pkg/operator/configobserver/featuregates"
 	"github.com/openshift/library-go/pkg/operator/events"
 	"github.com/openshift/library-go/pkg/operator/v1helpers"
 	"github.com/openshift/library-go/pkg/route/routeapihelpers"
 
 	"github.com/openshift/cluster-authentication-operator/pkg/controllers/common"
-	"github.com/openshift/cluster-authentication-operator/pkg/transport"
 )
 
 // proxyConfigChecker reports bad proxy configurations.
@@ -39,9 +34,8 @@ type proxyConfigChecker struct {
 	routeNamespace  string
 	caConfigMaps    map[string][]string // ns -> []configmapNames
 
-	oauthLister         configv1listers.OAuthLister
-	operatorAuthLister  operatorv1listers.AuthenticationLister
-	featureGateAccessor featuregates.FeatureGateAccess
+	oauthLister   configv1listers.OAuthLister
+	proxyResolver common.ProxyResolver
 
 	authConfigChecker common.AuthConfigChecker
 
@@ -58,19 +52,17 @@ func NewProxyConfigChecker(
 	recorder events.Recorder,
 	operatorClient v1helpers.OperatorClient,
 	oauthLister configv1listers.OAuthLister,
-	operatorAuthInformer operatorv1informers.AuthenticationInformer,
-	featureGateAccessor featuregates.FeatureGateAccess,
+	proxyResolver *common.AuthProxyResolver,
 ) factory.Controller {
 	p := proxyConfigChecker{
-		routeLister:         routeInformer.Lister(),
-		configMapLister:     configMapInformers.ConfigMapLister(),
-		routeName:           routeName,
-		routeNamespace:      routeNamespace,
-		caConfigMaps:        caConfigMaps,
-		oauthLister:         oauthLister,
-		operatorAuthLister:  operatorAuthInformer.Lister(),
-		featureGateAccessor: featureGateAccessor,
-		authConfigChecker:   authConfigChecker,
+		routeLister:       routeInformer.Lister(),
+		configMapLister:   configMapInformers.ConfigMapLister(),
+		routeName:         routeName,
+		routeNamespace:    routeNamespace,
+		caConfigMaps:      caConfigMaps,
+		oauthLister:       oauthLister,
+		proxyResolver:     proxyResolver,
+		authConfigChecker: authConfigChecker,
 	}
 
 	c := factory.New().
@@ -79,7 +71,7 @@ func NewProxyConfigChecker(
 			routeInformer.Informer(),
 		).
 		WithInformers(common.AuthConfigCheckerInformers[factory.Informer](&authConfigChecker)...).
-		WithInformers(operatorAuthInformer.Informer()).
+		WithInformers(proxyResolver.Informer()).
 		ResyncEvery(60 * time.Minute).
 		WithSyncDegradedOnError(operatorClient)
 
@@ -103,7 +95,7 @@ func (p *proxyConfigChecker) sync(ctx context.Context, syncCtx factory.SyncConte
 		return nil
 	}
 
-	proxy, err := common.ResolveProxy(p.featureGateAccessor, p.operatorAuthLister)
+	proxy, err := p.proxyResolver.ResolveProxy()
 	if err != nil {
 		return err
 	}
@@ -116,7 +108,7 @@ func (p *proxyConfigChecker) sync(ctx context.Context, syncCtx factory.SyncConte
 		return err
 	}
 
-	clientWithProxy, clientWithoutProxy, err := p.createHTTPClients(proxy)
+	clientWithProxy, clientWithoutProxy, err := p.createHTTPClients()
 	if err != nil {
 		return err
 	}
@@ -238,59 +230,43 @@ func (p *proxyConfigChecker) getRouteHealthzURL() (*url.URL, error) {
 }
 
 // createHTTPClients returns two HTTP clients — one that routes through the proxy
-// and one that connects directly. The proxy's trustedCA bundle (if any) is loaded
-// and appended to the system CA pool.
-func (p *proxyConfigChecker) createHTTPClients(proxy *common.ResolvedProxy) (*http.Client, *http.Client, error) {
-	caPool, err := p.getCACerts()
+// and one that connects directly.
+func (p *proxyConfigChecker) createHTTPClients() (*http.Client, *http.Client, error) {
+	caPool, err := p.getCAPool()
+	if err != nil {
+		return nil, nil, err
+	}
+	poolOpt := common.WithCertPool(caPool)
+
+	withProxy, err := p.proxyResolver.NewTransport(poolOpt)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	if len(proxy.TrustedCAName) > 0 {
-		caData, err := transport.LoadCAData(p.configMapLister, proxy.TrustedCAName, "ca-bundle.crt")
-		if err != nil {
-			return nil, nil, fmt.Errorf("failed to load proxy CA: %w", err)
-		}
-		caPool.AppendCertsFromPEM(caData)
+	withoutProxy, err := p.proxyResolver.NewTransport(poolOpt)
+	if err != nil {
+		return nil, nil, err
 	}
+	withoutProxy.Proxy = nil
 
-	tlsConfig := &tls.Config{RootCAs: caPool}
-	proxyFn := func(req *http.Request) (*url.URL, error) { return proxy.ProxyFunc()(req.URL) }
-
-	return &http.Client{
-			Transport: &http.Transport{
-				TLSClientConfig: tlsConfig,
-				Proxy:           proxyFn,
-			},
-		}, &http.Client{
-			Transport: &http.Transport{
-				TLSClientConfig: tlsConfig,
-			},
-		}, nil
+	return &http.Client{Transport: withProxy}, &http.Client{Transport: withoutProxy}, nil
 }
 
-// getCACerts retrieves the CA bundle in openshift cluster
-func (p *proxyConfigChecker) getCACerts() (*x509.CertPool, error) {
-	caPool := x509.NewCertPool()
-
+// getCAPool builds a certificate pool from the configured system trust ConfigMaps.
+func (p *proxyConfigChecker) getCAPool() (*x509.CertPool, error) {
+	pool := x509.NewCertPool()
 	for ns, configMaps := range p.caConfigMaps {
 		for _, cmName := range configMaps {
 			caCM, err := p.configMapLister.ConfigMaps(ns).Get(cmName)
 			if err != nil {
 				return nil, err
 			}
-
-			// In case this causes performance issues, consider caching the trusted
-			// certs pool.
-			// At the time of writing this comment, this should only happen once
-			// every 5 minutes and the trusted-ca CM contains around 130 certs.
-			if ok := caPool.AppendCertsFromPEM([]byte(caCM.Data["ca-bundle.crt"])); !ok {
-				return nil, fmt.Errorf("unable to append system trust ca bundle")
+			if ok := pool.AppendCertsFromPEM([]byte(caCM.Data["ca-bundle.crt"])); !ok {
+				return nil, fmt.Errorf("unable to parse CA bundle from configmap %s/%s", ns, cmName)
 			}
 		}
 	}
-
-	return caPool, nil
+	return pool, nil
 }
 
 // isEndpointReachable returns nil if the given endpoint can be reached using the given client

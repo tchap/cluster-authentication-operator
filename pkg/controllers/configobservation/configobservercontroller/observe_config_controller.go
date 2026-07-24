@@ -5,16 +5,15 @@ import (
 	"k8s.io/client-go/tools/cache"
 
 	configinformers "github.com/openshift/client-go/config/informers/externalversions"
-	operatorv1informers "github.com/openshift/client-go/operator/informers/externalversions/operator/v1"
 	"github.com/openshift/library-go/pkg/controller/factory"
 	"github.com/openshift/library-go/pkg/operator/configobserver"
 	"github.com/openshift/library-go/pkg/operator/configobserver/apiserver"
-	"github.com/openshift/library-go/pkg/operator/configobserver/featuregates"
 	configobserveroauth "github.com/openshift/library-go/pkg/operator/configobserver/oauth"
 	"github.com/openshift/library-go/pkg/operator/events"
 	"github.com/openshift/library-go/pkg/operator/resourcesynccontroller"
 	"github.com/openshift/library-go/pkg/operator/v1helpers"
 
+	"github.com/openshift/cluster-authentication-operator/pkg/controllers/common"
 	"github.com/openshift/cluster-authentication-operator/pkg/controllers/configobservation"
 	"github.com/openshift/cluster-authentication-operator/pkg/controllers/configobservation/console"
 	"github.com/openshift/cluster-authentication-operator/pkg/controllers/configobservation/infrastructure"
@@ -29,8 +28,7 @@ func NewConfigObserver(
 	resourceSyncer resourcesynccontroller.ResourceSyncer,
 	enabledClusterCapabilities sets.String,
 	eventRecorder events.Recorder,
-	operatorAuthInformer operatorv1informers.AuthenticationInformer,
-	featureGateAccessor featuregates.FeatureGateAccess,
+	proxyResolver *common.AuthProxyResolver,
 ) factory.Controller {
 	interestingNamespaces := []string{
 		"openshift-authentication",
@@ -85,8 +83,8 @@ func NewConfigObserver(
 			configobserver.WithPrefix(o, configobservation.OAuthServerConfigPrefix))
 	}
 
-	preRunCacheSynced = append(preRunCacheSynced, operatorAuthInformer.Informer().HasSynced)
-	informers = append(informers, operatorAuthInformer.Informer())
+	preRunCacheSynced = append(preRunCacheSynced, proxyResolver.Informer().HasSynced)
+	informers = append(informers, proxyResolver.Informer())
 
 	listers := configobservation.Listers{
 		ConfigMapLister: kubeInformersForNamespaces.ConfigMapLister(),
@@ -100,8 +98,7 @@ func NewConfigObserver(
 		ResourceSync:         resourceSyncer,
 		PreRunCachesSynced:   preRunCacheSynced,
 
-		OperatorAuthLister:  operatorAuthInformer.Lister(),
-		FeatureGateAccessor: featureGateAccessor,
+		ProxyResolver: proxyResolver,
 	}
 
 	// Check if the Console capability is enabled on the cluster and sync and add its informer, lister, and config observer

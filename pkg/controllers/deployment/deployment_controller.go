@@ -24,8 +24,6 @@ import (
 	"k8s.io/utils/ptr"
 
 	configinformer "github.com/openshift/client-go/config/informers/externalversions"
-	operatorv1informers "github.com/openshift/client-go/operator/informers/externalversions/operator/v1"
-	operatorv1listers "github.com/openshift/client-go/operator/listers/operator/v1"
 	routeinformers "github.com/openshift/client-go/route/informers/externalversions"
 	routev1listers "github.com/openshift/client-go/route/listers/route/v1"
 	"github.com/openshift/cluster-authentication-operator/bindata"
@@ -33,7 +31,6 @@ import (
 	bootstrap "github.com/openshift/library-go/pkg/authentication/bootstrapauthenticator"
 	"github.com/openshift/library-go/pkg/controller/factory"
 	"github.com/openshift/library-go/pkg/operator/apiserver/controller/workload"
-	"github.com/openshift/library-go/pkg/operator/configobserver/featuregates"
 	"github.com/openshift/library-go/pkg/operator/events"
 	"github.com/openshift/library-go/pkg/operator/resource/resourceapply"
 	"github.com/openshift/library-go/pkg/operator/resource/resourcemerge"
@@ -77,8 +74,7 @@ type oauthServerDeploymentSyncer struct {
 	podsLister            corev1listers.PodLister
 	routeLister           routev1listers.RouteLister
 
-	operatorAuthLister  operatorv1listers.AuthenticationLister
-	featureGateAccessor featuregates.FeatureGateAccess
+	proxyResolver common.ProxyResolver
 
 	authConfigChecker          common.AuthConfigChecker
 	bootstrapUserDataGetter    bootstrap.BootstrapUserDataGetter
@@ -99,8 +95,7 @@ func NewOAuthServerWorkloadController(
 	kubeInformersForTargetNamespace informers.SharedInformerFactory,
 	kubeInformersForSourceNamespace informers.SharedInformerFactory,
 	authConfigChecker common.AuthConfigChecker,
-	operatorAuthInformer operatorv1informers.AuthenticationInformer,
-	featureGateAccessor featuregates.FeatureGateAccess,
+	proxyResolver *common.AuthProxyResolver,
 ) factory.Controller {
 	targetNS := "openshift-authentication"
 
@@ -121,8 +116,7 @@ func NewOAuthServerWorkloadController(
 		podsLister:            kubeInformersForTargetNamespace.Core().V1().Pods().Lister(),
 		routeLister:           routeInformersForTargetNamespace.Route().V1().Routes().Lister(),
 
-		operatorAuthLister:  operatorAuthInformer.Lister(),
-		featureGateAccessor: featureGateAccessor,
+		proxyResolver: proxyResolver,
 
 		authConfigChecker:       authConfigChecker,
 		bootstrapUserDataGetter: bootstrapUserDataGetter,
@@ -138,7 +132,7 @@ func NewOAuthServerWorkloadController(
 	clusterScopedInformers := []factory.Informer{
 		configInformers.Config().V1().Ingresses().Informer(),
 		nodeInformer.Informer(),
-		operatorAuthInformer.Informer(),
+		proxyResolver.Informer(),
 	}
 	clusterScopedInformers = append(clusterScopedInformers, common.AuthConfigCheckerInformers[factory.Informer](&authConfigChecker)...)
 
@@ -222,7 +216,7 @@ func (c *oauthServerDeploymentSyncer) Sync(ctx context.Context, syncContext fact
 		return nil, false, append(errs, err)
 	}
 
-	proxy, err := common.ResolveProxy(c.featureGateAccessor, c.operatorAuthLister)
+	proxy, err := c.proxyResolver.ResolveProxy()
 	if err != nil {
 		return nil, false, append(errs, err)
 	}

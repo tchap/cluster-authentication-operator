@@ -2,12 +2,10 @@ package customroute
 
 import (
 	"context"
-	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
 	"net/http"
-	"net/url"
 	"reflect"
 	"time"
 
@@ -20,7 +18,6 @@ import (
 	"github.com/openshift/library-go/pkg/route/routeapihelpers"
 
 	"github.com/openshift/cluster-authentication-operator/pkg/controllers/common"
-	"github.com/openshift/cluster-authentication-operator/pkg/transport"
 )
 
 var (
@@ -119,8 +116,8 @@ func degradeIfTimeElapsed(conditions []metav1.Condition, condition *v1.Condition
 	}
 }
 
-func checkRouteAvailability(secretLister corev1listers.SecretLister, configMapLister corev1listers.ConfigMapLister, ingressConfig *configv1.Ingress, route *routev1.Route, proxy *common.ResolvedProxy) []*v1.ConditionApplyConfiguration {
-	if err := routeAvailability(secretLister, configMapLister, route.Spec.Host, ingressConfig, proxy); err != nil {
+func checkRouteAvailability(secretLister corev1listers.SecretLister, proxyResolver common.ProxyResolver, ingressConfig *configv1.Ingress, route *routev1.Route) []*v1.ConditionApplyConfiguration {
+	if err := routeAvailability(secretLister, proxyResolver, route.Spec.Host, ingressConfig); err != nil {
 		now := metav1.Now()
 		reason := "ErrorReachingOutToService"
 		message := fmt.Sprintf("unexpected error at %s: %v", route.Spec.Host, err)
@@ -141,7 +138,7 @@ func checkRouteAvailability(secretLister corev1listers.SecretLister, configMapLi
 	return nil
 }
 
-func routeAvailability(secretLister corev1listers.SecretLister, configMapLister corev1listers.ConfigMapLister, host string, ingress *configv1.Ingress, proxy *common.ResolvedProxy) error {
+func routeAvailability(secretLister corev1listers.SecretLister, proxyResolver common.ProxyResolver, host string, ingress *configv1.Ingress) error {
 	healthzURL := "https://" + host + "/healthz"
 
 	reqCtx, cancel := context.WithTimeout(context.TODO(), 10*time.Second) // avoid waiting forever
@@ -157,27 +154,14 @@ func routeAvailability(secretLister corev1listers.SecretLister, configMapLister 
 		return err
 	}
 
-	rootCAs := x509.NewCertPool()
-	if ok := rootCAs.AppendCertsFromPEM([]byte(certBytes)); !ok {
+	tr, err := proxyResolver.NewTransport(common.WithCA("router-certs", []byte(certBytes)))
+	if err != nil {
 		return err
 	}
 
-	if len(proxy.TrustedCAName) > 0 {
-		caData, err := transport.LoadCAData(configMapLister, proxy.TrustedCAName, "ca-bundle.crt")
-		if err != nil {
-			return fmt.Errorf("failed to load proxy CA: %w", err)
-		}
-		rootCAs.AppendCertsFromPEM(caData)
-	}
-
 	httpClient := http.Client{
-		Timeout: 5 * time.Second,
-		Transport: &http.Transport{
-			Proxy: func(req *http.Request) (*url.URL, error) { return proxy.ProxyFunc()(req.URL) },
-			TLSClientConfig: &tls.Config{
-				RootCAs: rootCAs,
-			},
-		},
+		Timeout:   5 * time.Second,
+		Transport: tr,
 	}
 
 	// Make a request to the endpoint, expect a 403

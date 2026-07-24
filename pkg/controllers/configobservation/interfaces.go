@@ -5,10 +5,10 @@ import (
 	"k8s.io/client-go/tools/cache"
 
 	configlistersv1 "github.com/openshift/client-go/config/listers/config/v1"
-	operatorv1listers "github.com/openshift/client-go/operator/listers/operator/v1"
 	"github.com/openshift/library-go/pkg/operator/configobserver"
-	"github.com/openshift/library-go/pkg/operator/configobserver/featuregates"
 	"github.com/openshift/library-go/pkg/operator/resourcesynccontroller"
+
+	"github.com/openshift/cluster-authentication-operator/pkg/controllers/common"
 )
 
 var _ configobserver.Listers = Listers{}
@@ -28,8 +28,7 @@ type Listers struct {
 	OAuthLister_         configlistersv1.OAuthLister
 	IngressLister        configlistersv1.IngressLister
 
-	OperatorAuthLister  operatorv1listers.AuthenticationLister
-	FeatureGateAccessor featuregates.FeatureGateAccess
+	ProxyResolver common.ProxyResolver
 
 	ResourceSync       resourcesynccontroller.ResourceSyncer
 	PreRunCachesSynced []cache.InformerSynced

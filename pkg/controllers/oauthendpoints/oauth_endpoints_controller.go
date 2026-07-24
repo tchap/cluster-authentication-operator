@@ -18,11 +18,9 @@ import (
 	routev1 "github.com/openshift/api/route/v1"
 	configv1informers "github.com/openshift/client-go/config/informers/externalversions/config/v1"
 	configv1lister "github.com/openshift/client-go/config/listers/config/v1"
-	operatorv1informers "github.com/openshift/client-go/operator/informers/externalversions/operator/v1"
 	routev1informers "github.com/openshift/client-go/route/informers/externalversions/route/v1"
 	routev1listers "github.com/openshift/client-go/route/listers/route/v1"
 	"github.com/openshift/library-go/pkg/controller/factory"
-	"github.com/openshift/library-go/pkg/operator/configobserver/featuregates"
 	"github.com/openshift/library-go/pkg/operator/events"
 	"github.com/openshift/library-go/pkg/operator/v1helpers"
 
@@ -39,8 +37,7 @@ func NewOAuthRouteCheckController(
 	kubeInformersForConfigNS informers.SharedInformerFactory,
 	routeInformerNamespaces routev1informers.RouteInformer,
 	ingressInformerAllNamespaces configv1informers.IngressInformer,
-	operatorAuthInformer operatorv1informers.AuthenticationInformer,
-	featureGateAccessor featuregates.FeatureGateAccess,
+	proxyResolver *common.AuthProxyResolver,
 	authConfigChecker common.AuthConfigChecker,
 	systemCABundle []byte,
 	recorder events.Recorder,
@@ -61,7 +58,7 @@ func NewOAuthRouteCheckController(
 	}
 
 	getTLSConfigFunc := func() (*tls.Config, error) {
-		proxy, err := common.ResolveProxy(featureGateAccessor, operatorAuthInformer.Lister())
+		proxy, err := proxyResolver.ResolveProxy()
 		if err != nil {
 			return nil, err
 		}
@@ -69,7 +66,7 @@ func NewOAuthRouteCheckController(
 	}
 
 	getProxyFn := transport.ProxyFunc(func(reqURL *url.URL) (*url.URL, error) {
-		proxy, err := common.ResolveProxy(featureGateAccessor, operatorAuthInformer.Lister())
+		proxy, err := proxyResolver.ResolveProxy()
 		if err != nil {
 			return nil, err
 		}
@@ -83,7 +80,7 @@ func NewOAuthRouteCheckController(
 		secretInformer,
 		routeInformer,
 		ingressInformer,
-		operatorAuthInformer.Informer(),
+		proxyResolver.Informer(),
 	}
 	informers = append(informers, common.AuthConfigCheckerInformers[factory.Informer](&authConfigChecker)...)
 

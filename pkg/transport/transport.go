@@ -8,8 +8,6 @@ import (
 	"net/http"
 	"net/url"
 
-	"golang.org/x/net/http/httpproxy"
-
 	knet "k8s.io/apimachinery/pkg/util/net"
 	corelistersv1 "k8s.io/client-go/listers/core/v1"
 	ktransport "k8s.io/client-go/transport"
@@ -25,61 +23,10 @@ func TransportFor(serverName string, caData, certData, keyData []byte) (http.Rou
 	if len(caData) == 0 && len(certData) == 0 && len(keyData) == 0 {
 		return ktransport.DebugWrappers(http.DefaultTransport), nil
 	}
-	transport, err := newTransport(serverName, caData, certData, keyData)
+	transport, err := NewTransport(serverName, caData, certData, keyData)
 	if err != nil {
 		return nil, err
 	}
-	return ktransport.DebugWrappers(transport), nil
-}
-
-// CAReference identifies a CA bundle stored in a ConfigMap.
-type CAReference struct {
-	ConfigMapName string
-	ConfigMapKey  string
-}
-
-// TransportForCARef creates an http.RoundTripper with TLS configured from
-// the given CA ConfigMap references and explicit proxy settings. Each
-// CAReference is loaded via the lister and appended to the trust pool.
-// When httpProxy or httpsProxy is non-empty, the transport routes requests
-// through the proxy. When both are empty, no proxy is used.
-func TransportForCARef(
-	cmLister corelistersv1.ConfigMapLister,
-	caRefs []CAReference,
-	httpProxy, httpsProxy, noProxy string,
-) (http.RoundTripper, error) {
-	var caData []byte
-	for _, ref := range caRefs {
-		data, err := LoadCAData(cmLister, ref.ConfigMapName, ref.ConfigMapKey)
-		if err != nil {
-			return nil, err
-		}
-		caData = append(caData, data...)
-	}
-
-	if len(caData) == 0 && len(httpProxy) == 0 && len(httpsProxy) == 0 {
-		return TransportFor("", nil, nil, nil)
-	}
-
-	transport, err := newTransport("", caData, nil, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	if len(httpProxy) > 0 || len(httpsProxy) > 0 {
-		proxyCfg := httpproxy.Config{
-			HTTPProxy:  httpProxy,
-			HTTPSProxy: httpsProxy,
-			NoProxy:    noProxy,
-		}
-		proxyFunc := proxyCfg.ProxyFunc()
-		transport.Proxy = func(req *http.Request) (*url.URL, error) {
-			return proxyFunc(req.URL)
-		}
-	} else {
-		transport.Proxy = nil
-	}
-
 	return ktransport.DebugWrappers(transport), nil
 }
 
@@ -101,8 +48,8 @@ func LoadCAData(cmLister corelistersv1.ConfigMapLister, caConfigMapName, key str
 	return caData, nil
 }
 
-// newTransport creates a fresh *http.Transport with TLS configured from the given parameters.
-func newTransport(serverName string, caData, certData, keyData []byte) (*http.Transport, error) {
+// NewTransport creates a fresh *http.Transport with TLS configured from the given parameters.
+func NewTransport(serverName string, caData, certData, keyData []byte) (*http.Transport, error) {
 	if (len(certData) == 0) != (len(keyData) == 0) {
 		return nil, errors.New("cert and key data must be specified together")
 	}
